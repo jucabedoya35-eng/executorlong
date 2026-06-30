@@ -1016,11 +1016,17 @@ class ExecutionManager:
         except Exception as e:
             log.error(f"_sync_ws_symbols: {e}")
 
-    async def get_entry_reference_price(self, symbol: str, extra_symbols: Optional[list[str]] = None) -> float:
+    async def get_entry_reference_price(
+        self,
+        symbol: str,
+        extra_symbols: Optional[list[str]] = None,
+        fallback_price: float = 0.0,
+    ) -> float:
         """
         Resuelve el precio REAL de entrada — NUNCA confía en el `price`
-        que llega en la señal, que es solo informativo/de cuando se
-        generó la señal y puede llevar segundos de desfase.
+        que llega en la señal salvo como ÚLTIMO recurso (ver punto 4),
+        ya que normalmente es solo informativo/de cuando se generó la
+        señal y puede llevar segundos de desfase.
 
         Orden de preferencia (siempre WS antes que REST):
         1. Caché WS ya activa para el símbolo — pero SÓLO si es reciente
@@ -1033,10 +1039,20 @@ class ExecutionManager:
            suscribe al WS de precios y se espera a que llegue un tick
            fresco — en vez de descartar la apertura o reusar algo stale.
         3. Si el WS no entrega nada a tiempo (símbolo nuevo, lag de
-           suscripción, etc.), se cae a REST (ticker/price) como último
-           recurso — pero nunca si REST ya está bajo ban de IP (-1003):
+           suscripción, etc.), se cae a REST (ticker/price) como recurso
+           adicional — pero nunca si REST ya está bajo ban de IP (-1003):
            en ese caso reintentar solo extiende el bloqueo. Si está
-           baneado, se prefiere esperar más tiempo al WS.
+           baneado, en vez de caer a REST se sigue insistiendo en el WS
+           (quedó suscrito en el paso 2) durante todo lo que dure el ban,
+           refrescando la suscripción periódicamente por si el primer
+           intento se perdió.
+        4. Si tras esperar el WS sigue sin entregar nada Y se dispone de
+           un `fallback_price` (típicamente el precio que traía la señal
+           de entrada), se usa ESE como último recurso en vez de cancelar
+           la apertura — dejando bien claro en el log que es un precio
+           aproximado y no confirmado contra mercado. Cancelar la
+           operación solo ocurre si no hay absolutamente ningún precio
+           disponible (ni WS, ni REST, ni fallback).
         """
         try:
             p = self.price_ws.get_price(symbol, max_age_s=MAX_PRICE_AGE_S)
@@ -1045,13 +1061,16 @@ class ExecutionManager:
         except Exception:
             pass
 
-        try:
-            wanted = self.active_symbols | {symbol}
-            if extra_symbols:
-                wanted |= set(extra_symbols)
-            self.price_ws.update_symbols(list(wanted))
-        except Exception as e:
-            log.warning(f"get_entry_reference_price: no se pudo suscribir {symbol} al WS: {e}")
+        def _subscribe():
+            try:
+                wanted = self.active_symbols | {symbol}
+                if extra_symbols:
+                    wanted |= set(extra_symbols)
+                self.price_ws.update_symbols(list(wanted))
+            except Exception as e:
+                log.warning(f"get_entry_reference_price: no se pudo suscribir {symbol} al WS: {e}")
+
+        _subscribe()
 
         rest_banned = False
         try:
@@ -1059,12 +1078,53 @@ class ExecutionManager:
         except Exception:
             pass
 
-        # Si REST está baneado, le damos al WS mucho más margen (hasta
-        # ~15s) antes de rendirnos, en vez de caer a REST y empeorar el
-        # bloqueo de IP. Si REST está disponible, el margen normal (~3s)
-        # es suficiente porque hay un respaldo razonable después.
-        wait_iterations = 75 if rest_banned else 15
-        for _ in range(wait_iterations):
+        if rest_banned:
+            # No cancelamos: insistimos en el WS durante todo el ban,
+            # re-suscribiendo cada cierto tiempo por si el símbolo se
+            # cayó del stream o el primer mensaje de suscripción se
+            # perdió. Solo si se agota el ban entero sin un solo tick
+            # recurrimos al fallback_price (si hay) en vez de cancelar.
+            remaining_s = 0.0
+            try:
+                remaining_s = self.api._rest_ban_remaining_s()
+            except Exception:
+                remaining_s = 30.0
+            deadline = asyncio.get_event_loop().time() + max(remaining_s, 5.0) + 2.0
+            resub_every_s = 5.0
+            last_resub = asyncio.get_event_loop().time()
+            log.warning(
+                f"get_entry_reference_price: {symbol} sin precio WS y REST baneado "
+                f"(~{remaining_s:.0f}s) — quedando suscrito al WS y esperando en vez de cancelar"
+            )
+            while asyncio.get_event_loop().time() < deadline:
+                await asyncio.sleep(0.2)
+                try:
+                    p = self.price_ws.get_price(symbol, max_age_s=MAX_PRICE_AGE_S)
+                    if p and p > 0:
+                        return float(p)
+                except Exception:
+                    pass
+                now = asyncio.get_event_loop().time()
+                if now - last_resub >= resub_every_s:
+                    _subscribe()
+                    last_resub = now
+
+            if fallback_price and fallback_price > 0:
+                log.warning(
+                    f"get_entry_reference_price: {symbol} sigue sin precio WS tras esperar todo el ban de REST "
+                    f"— se usa el precio de la señal ({fallback_price}) como último recurso para NO cancelar la apertura"
+                )
+                return float(fallback_price)
+
+            log.error(
+                f"get_entry_reference_price: {symbol} sin precio WS tras esperar el ban completo de REST "
+                f"y sin fallback_price disponible — no es posible abrir sin ningún precio"
+            )
+            return 0.0
+
+        # REST no está baneado: margen normal de WS (~3s) y luego REST
+        # como respaldo razonable.
+        for _ in range(15):
             await asyncio.sleep(0.2)
             try:
                 p = self.price_ws.get_price(symbol, max_age_s=MAX_PRICE_AGE_S)
@@ -1073,13 +1133,6 @@ class ExecutionManager:
             except Exception:
                 pass
 
-        if rest_banned:
-            log.error(
-                f"get_entry_reference_price: {symbol} sin precio WS tras esperar y REST sigue baneado "
-                f"(~{self.api._rest_ban_remaining_s():.0f}s restantes) — apertura cancelada sin tocar REST"
-            )
-            return 0.0
-
         try:
             p = await self.api.get_rest_price(symbol)
             if p > 0:
@@ -1087,6 +1140,13 @@ class ExecutionManager:
                 return p
         except Exception as e:
             log.error(f"get_entry_reference_price: REST también falló para {symbol}: {e}")
+
+        if fallback_price and fallback_price > 0:
+            log.warning(
+                f"get_entry_reference_price: {symbol} sin precio por WS ni REST — se usa el precio de la señal "
+                f"({fallback_price}) como último recurso para NO cancelar la apertura"
+            )
+            return float(fallback_price)
 
         return 0.0
 
@@ -1176,9 +1236,12 @@ class ExecutionManager:
         # diferencia con el mercado. Siempre se solicita el precio real
         # — WS primero, REST como respaldo — y con ESE se calcula la
         # cantidad final y se registra la entrada.
-        ref_price = await self.get_entry_reference_price(symbol)
+        ref_price = await self.get_entry_reference_price(symbol, fallback_price=price)
         if ref_price <= 0:
-            log.error(f"open_trade: no se pudo obtener un precio real para {symbol} (ni WS ni REST) — apertura cancelada")
+            log.error(
+                f"open_trade: no se pudo obtener NINGÚN precio para {symbol} (ni WS, ni REST, ni precio de señal) "
+                f"— apertura cancelada"
+            )
             return None
 
         if price > 0 and abs(ref_price - price) / max(price, 1e-9) > 0.01:
