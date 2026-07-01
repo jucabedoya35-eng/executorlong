@@ -477,7 +477,7 @@ class BinanceAPI:
     # de IP que impiden golpear /leverageBracket por cada símbolo). En
     # vez de abortar la apertura, se prueba esta escalera 10x→4x hasta
     # que Binance acepte uno.
-    LEVERAGE_FALLBACK_LADDER = [10, 9, 8, 7, 6, 5, 4]
+    LEVERAGE_FALLBACK_LADDER = [ 5, 4]
 
     async def set_leverage_with_fallback(self, symbol: str, preferred: int) -> int:
         """
