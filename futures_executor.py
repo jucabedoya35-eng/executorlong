@@ -52,7 +52,6 @@ POSITION_POLL_S = int(os.environ.get("POSITION_POLL_S", "30"))
 MIN_NOTIONAL_USDT = float(os.environ.get("MIN_NOTIONAL_USDT", "5.1"))
 NOTIONAL_SAFETY_BUFFER_PCT = float(os.environ.get("NOTIONAL_SAFETY_BUFFER_PCT", "2.0"))
 # Edad máxima (segundos) que se acepta para un precio cacheado del WS antes
-# de considerarlo "no confiable" y forzar espera de un tick fresco / REST.
 # Evita el bug de reabrir un símbolo y heredar un precio viejo guardado.
 MAX_PRICE_AGE_S = float(os.environ.get("MAX_PRICE_AGE_S", "5.0"))
 MIN_VALID_PRICE = 0.00001
