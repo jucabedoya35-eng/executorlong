@@ -672,7 +672,10 @@ class BinanceAPI:
         }
         if position_side:
             params["positionSide"] = position_side
-        if reduce_only:
+        # Mismo motivo que en create_market_order: reduceOnly no se puede
+        # enviar junto con positionSide=LONG/SHORT (Hedge) — Binance lo
+        # rechaza con -1106.
+        if reduce_only and position_side not in ("LONG", "SHORT"):
             params["reduceOnly"] = "true"
         result = await self._request("order.place", params=params, signed=True)
         return result if isinstance(result, dict) else {"raw": result}
@@ -829,7 +832,15 @@ class BinanceAPI:
         }
         if position_side:
             params["positionSide"] = position_side
-        if reduce_only:
+        # En Hedge Mode (positionSide=LONG/SHORT) Binance RECHAZA el
+        # parámetro reduceOnly con -1106 "Parameter 'reduceonly' sent
+        # when not required" — side+positionSide ya implica reducción
+        # por sí solo. Sólo tiene sentido enviarlo en One-way
+        # (positionSide=BOTH o ausente). Se filtra aquí, centralizado,
+        # para que ningún caller (close_position_market,
+        # close_all_positions, etc.) tenga que acordarse de esto.
+        is_hedge_side = position_side in ("LONG", "SHORT")
+        if reduce_only and not is_hedge_side:
             params["reduceOnly"] = "true"
         result = await self._request("order.place", params=params, signed=True)
         return result if isinstance(result, dict) else {"raw": result}
