@@ -49,21 +49,10 @@ def set_hedge_mode_runtime(value: bool) -> None:
     HEDGE_MODE = bool(value)
 PORT            = int(os.environ.get("PORT", "10000"))
 POSITION_POLL_S = int(os.environ.get("POSITION_POLL_S", "30"))
-# Intervalo mínimo entre consultas de balance (WS API, account.balance).
-# Antes se pedía balance fresco justo después de CADA apertura/cierre de
-# posición, lo que hacía que leverage (REST vía Fixie) + orden (WS) +
-# balance (WS) salieran casi en el mismo instante hacia Binance. Ahora
-# refresh_balance() se autolimita a como máximo 1 consulta cada
-# BALANCE_POLL_S segundos, y un loop independiente (balance_sync_loop)
-# se encarga de mantenerlo actualizado sin depender de la actividad de
-# trading.
 BALANCE_POLL_S  = int(os.environ.get("BALANCE_POLL_S", "60"))
 
 MIN_NOTIONAL_USDT = float(os.environ.get("MIN_NOTIONAL_USDT", "5.1"))
 NOTIONAL_SAFETY_BUFFER_PCT = float(os.environ.get("NOTIONAL_SAFETY_BUFFER_PCT", "2.0"))
-# Edad máxima (segundos) que se acepta para un precio cacheado del WS antes
-# de considerarlo "no confiable" y forzar espera de un tick fresco / REST.
-# Evita el bug de reabrir un símbolo y heredar un precio viejo guardado.
 MAX_PRICE_AGE_S = float(os.environ.get("MAX_PRICE_AGE_S", "5.0"))
 MIN_VALID_PRICE = 0.00001
 
@@ -77,16 +66,25 @@ REST_FAPI_URL = os.environ.get(
     "https://testnet.binancefuture.com" if USE_TESTNET else "https://fapi.binance.com",
 )
 
-# ── Proxy Fixie ──────────────────────────────────────────────
-# Fixie provee una IP saliente estática para poder whitelistear la API key
-# de Binance desde plataformas (Render/Heroku/etc.) sin IP fija propia.
-# USO EXCLUSIVO: la única llamada REST que sigue siendo obligatoriamente
-# REST (POST /fapi/v1/leverage, sin equivalente en la WS API de Binance)
-# se envía a través de este proxy. Ningún otro tráfico (WS API de órdenes/
-# balance/posición, ni el resto de llamadas REST que tampoco tienen
-# equivalente WS) pasa por Fixie — eso quedó así por decisión explícita.
-# Variable típica que entrega el addon de Fixie: FIXIE_URL=http://user:pass@host:port
-FIXIE_URL = os.environ.get("FIXIE_URL", "http://fixie:CuLSweHyTOG4Lg3@ventoux.usefixie.com:80").strip()
+PROXY_URLS = [
+    "http://fixie:CuLSweHyTOG4Lg3@54.195.3.54:80",
+    "http://fixie:CuLSweHyTOG4Lg3@54.217.142.99:80",
+]
+
+_raw_proxy_urls = os.environ.get("PROXY_URLS", "").strip()
+if _raw_proxy_urls:
+    PROXY_URLS = [u.strip() for u in _raw_proxy_urls.split(",") if u.strip()]
+else:
+    # Retrocompatibilidad: si solo existe FIXIE_URL (una única salida),
+    # se usa como único elemento de la lista.
+    _legacy_fixie = os.environ.get(
+        "FIXIE_URL", "http://fixie:CuLSweHyTOG4Lg3@ventoux.usefixie.com:80"
+    ).strip()
+    PROXY_URLS = [_legacy_fixie] if _legacy_fixie else []
+
+# Se mantiene por compatibilidad con el resto del código/dashboard que
+# solo necesita saber "¿hay algún proxy configurado?".
+FIXIE_URL = PROXY_URLS[0] if PROXY_URLS else ""
 
 logging.basicConfig(
     level=logging.INFO,
@@ -276,6 +274,11 @@ class BinanceAPI:
         # de seguir reintentando y empeorar/alargar el bloqueo.
         self._rest_ban_until_ms: float = 0.0
 
+        # Freno de bloqueo POR PROXY/IP para la llamada de leverage: cada
+        # URL de PROXY_URLS tiene su propio timestamp de baneo, así una
+        # IP baneada no tumba a las demás — se salta a la siguiente.
+        self._proxy_ban_until_ms: dict[str, float] = {}
+
     @staticmethod
     def _payload_string(params: dict) -> str:
         return "&".join(
@@ -318,6 +321,45 @@ class BinanceAPI:
     def _check_rest_ban_or_raise(self):
         if self._is_rest_banned():
             raise RuntimeError(f"REST omitida: IP bloqueada por Binance (-1003), quedan ~{self._rest_ban_remaining_s():.0f}s")
+
+    @staticmethod
+    def _proxy_label(proxy_url: Optional[str]) -> str:
+        """Etiqueta legible sin credenciales, solo para logs (host:puerto)."""
+        if not proxy_url:
+            return "directo (sin proxy)"
+        try:
+            return proxy_url.split("@", 1)[-1]
+        except Exception:
+            return "proxy"
+
+    def _is_proxy_banned(self, proxy_url: str) -> bool:
+        until = self._proxy_ban_until_ms.get(proxy_url, 0.0)
+        return until > datetime.now(timezone.utc).timestamp() * 1000
+
+    def _proxy_ban_remaining_s(self, proxy_url: str) -> float:
+        until = self._proxy_ban_until_ms.get(proxy_url, 0.0)
+        return max(0.0, until / 1000 - datetime.now(timezone.utc).timestamp())
+
+    def _note_possible_proxy_ban(self, proxy_url: str, response_text: str):
+        """
+        Igual que _note_possible_ip_ban pero por proxy individual: si
+        Binance devuelve -1003 usando `proxy_url`, guarda el timestamp de
+        baneo SOLO para esa IP, dejando libres las demás de PROXY_URLS.
+        """
+        if "-1003" not in response_text:
+            return
+        match = re.search(r"banned until (\d+)", response_text)
+        if not match:
+            return
+        until_ms = float(match.group(1))
+        if until_ms > self._proxy_ban_until_ms.get(proxy_url, 0.0):
+            self._proxy_ban_until_ms[proxy_url] = until_ms
+            until_dt = datetime.fromtimestamp(until_ms / 1000, tz=timezone.utc)
+            log.error(
+                f"⛔ IP {self._proxy_label(proxy_url)} bloqueada por Binance (-1003) hasta "
+                f"{until_dt.strftime('%Y-%m-%d %H:%M:%S UTC')} (~{self._proxy_ban_remaining_s(proxy_url):.0f}s) "
+                f"— se saltará a la siguiente IP de PROXY_URLS si hay alguna disponible"
+            )
 
     def _ws_alive(self) -> bool:
         return bool(
@@ -469,40 +511,86 @@ class BinanceAPI:
             if not force and self._leverage_cache.get(symbol) == leverage:
                 return {"symbol": symbol, "leverage": leverage, "cached": True}
 
-            self._check_rest_ban_or_raise()
-
-            session = await self._ensure_http_session()
-            params = {
-                "symbol": symbol,
-                "leverage": leverage,
-                "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
-                "recvWindow": 5000,
-            }
-            query = self._payload_string(params)
-            signature = self._sign(params)
-            url = f"{REST_FAPI_URL}/fapi/v1/leverage?{query}&signature={signature}"
-            headers = {"X-MBX-APIKEY": self.api_key}
-
-            # Única llamada REST del bot que se mantiene fuera de la WS API
-            # (Binance no expone equivalente para cambiar leverage). Se
-            # envía siempre a través de Fixie si FIXIE_URL está configurado.
-            request_kwargs = {"headers": headers, "timeout": aiohttp.ClientTimeout(total=10)}
-            if FIXIE_URL:
-                request_kwargs["proxy"] = FIXIE_URL
-
-            async with session.post(url, **request_kwargs) as resp:
-                text = await resp.text()
-                if resp.status != 200:
-                    self._note_possible_ip_ban(text)
-                    raise RuntimeError(f"REST set_leverage error {resp.status}: {text}")
-                try:
-                    data = json.loads(text)
-                except Exception:
-                    data = {"raw": text}
-                via = "Fixie" if FIXIE_URL else "directo (sin proxy)"
-                log.info(f"Leverage REST OK vía {via}: {symbol} → {data.get('leverage', leverage)}x")
+            if not PROXY_URLS:
+                # Sin ningún proxy configurado: sale con la IP directa del proceso.
+                data = await self._set_leverage_via_proxy(symbol, leverage, proxy_url=None)
                 self._leverage_cache[symbol] = leverage
                 return data
+
+            # Solo se intenta con las IPs que ahora mismo NO están marcadas
+            # como baneadas por Binance (-1003).
+            candidates = [p for p in PROXY_URLS if not self._is_proxy_banned(p)]
+            if not candidates:
+                soonest = min(self._proxy_ban_remaining_s(p) for p in PROXY_URLS)
+                raise RuntimeError(
+                    f"REST omitida: IP bloqueada por Binance (-1003), quedan ~{soonest:.0f}s "
+                    f"(las {len(PROXY_URLS)} IP(s) de PROXY_URLS están bloqueadas ahora mismo)"
+                )
+
+            last_err: Optional[Exception] = None
+            for proxy_url in candidates:
+                try:
+                    data = await self._set_leverage_via_proxy(symbol, leverage, proxy_url=proxy_url)
+                    self._leverage_cache[symbol] = leverage
+                    return data
+                except Exception as e:
+                    last_err = e
+                    if self._is_proxy_banned(proxy_url):
+                        log.warning(
+                            f"set_leverage: {symbol} — IP {self._proxy_label(proxy_url)} quedó bloqueada; "
+                            f"probando con la siguiente IP de PROXY_URLS"
+                        )
+                        continue
+                    if isinstance(e, (aiohttp.ClientError, asyncio.TimeoutError)):
+                        log.warning(
+                            f"set_leverage: {symbol} — fallo de conexión con {self._proxy_label(proxy_url)} "
+                            f"({e!r}); probando con la siguiente IP de PROXY_URLS"
+                        )
+                        continue
+                    # Rechazo que no tiene que ver con bloqueo de IP (p.ej. -4028
+                    # leverage inválido para el símbolo): cambiar de IP no lo va a
+                    # resolver, así que se propaga tal cual para que lo maneje
+                    # set_leverage_with_fallback (escalera de leverage).
+                    raise
+            # Se agotaron todas las IPs candidatas por errores de conexión/baneo.
+            raise last_err if last_err else RuntimeError("set_leverage: sin IPs disponibles en PROXY_URLS")
+
+    async def _set_leverage_via_proxy(self, symbol: str, leverage: int, proxy_url: Optional[str]) -> dict:
+        """Ejecuta el POST /fapi/v1/leverage a través de una IP concreta
+        (o directo si proxy_url es None). No cachea leverage ni maneja
+        reintentos entre IPs — eso lo hace set_leverage()."""
+        session = await self._ensure_http_session()
+        params = {
+            "symbol": symbol,
+            "leverage": leverage,
+            "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
+            "recvWindow": 5000,
+        }
+        query = self._payload_string(params)
+        signature = self._sign(params)
+        url = f"{REST_FAPI_URL}/fapi/v1/leverage?{query}&signature={signature}"
+        headers = {"X-MBX-APIKEY": self.api_key}
+
+        # Única llamada REST del bot que se mantiene fuera de la WS API
+        # (Binance no expone equivalente para cambiar leverage).
+        request_kwargs = {"headers": headers, "timeout": aiohttp.ClientTimeout(total=10)}
+        if proxy_url:
+            request_kwargs["proxy"] = proxy_url
+
+        async with session.post(url, **request_kwargs) as resp:
+            text = await resp.text()
+            if resp.status != 200:
+                if proxy_url:
+                    self._note_possible_proxy_ban(proxy_url, text)
+                else:
+                    self._note_possible_ip_ban(text)
+                raise RuntimeError(f"REST set_leverage error {resp.status}: {text}")
+            try:
+                data = json.loads(text)
+            except Exception:
+                data = {"raw": text}
+            log.info(f"Leverage REST OK vía {self._proxy_label(proxy_url)}: {symbol} → {data.get('leverage', leverage)}x")
+            return data
 
     # ── Escalera de leverage de respaldo ───────────────────────────────
     # Algunos símbolos rechazan el leverage configurado por defecto
@@ -2830,7 +2918,7 @@ async def dashboard_handler(request: web.Request) -> web.Response:
   <h1>⚡ Futures Executor WS — Binance USDT Perpetuos [{env}]</h1>
   <div class="info-banner">
     📡 Trading por <b>WebSocket API</b>. Precios en tiempo real vía <b>ws.py</b>. 
-    Cambios de leverage por <b>REST{' vía Fixie' if FIXIE_URL else ''}</b> (la WS API no lo soporta). Leverage configurado: <b>{LEVERAGE}x</b>{' | Modo Hedge' if HEDGE_MODE else ' | Modo One-way'}.
+    Cambios de leverage por <b>REST{f' vía proxy ({len(PROXY_URLS)} IP(s))' if PROXY_URLS else ''}</b> (la WS API no lo soporta). Leverage configurado: <b>{LEVERAGE}x</b>{' | Modo Hedge' if HEDGE_MODE else ' | Modo One-way'}.
   </div>
 
   <div class="grid">
@@ -3017,12 +3105,16 @@ async def main():
     log.info(f"║   Entorno: {env_tag:<44}║")
     log.info(f"║   Leverage: {LEVERAGE}x | Poll cierre ext.: {POSITION_POLL_S}s              ║")
     log.info("╚══════════════════════════════════════════════════════╝")
-    if FIXIE_URL:
-        log.info("Fixie configurado: la llamada REST de leverage se enviará por proxy.")
+    if PROXY_URLS:
+        _labels = ", ".join(BinanceAPI._proxy_label(p) for p in PROXY_URLS)
+        log.info(
+            f"Proxy(s) configurado(s) para leverage ({len(PROXY_URLS)}): {_labels}. "
+            f"Si Binance banea una IP (-1003), se salta a la siguiente automáticamente."
+        )
     else:
         log.warning(
-            "FIXIE_URL no está configurada — la llamada REST de leverage (y el resto de "
-            "endpoints REST sin equivalente WS) saldrá con la IP directa del proceso."
+            "PROXY_URLS / FIXIE_URL no están configuradas — la llamada REST de leverage "
+            "saldrá con la IP directa del proceso (sin whitelisting de IP fija)."
         )
 
     if not BINANCE_API_KEY or not BINANCE_API_SECRET:
@@ -3061,7 +3153,7 @@ async def main():
             f"⚡ <b>Leverage:</b> <code>{LEVERAGE}x</code>\n"
             f"📡 <b>Órdenes:</b> WebSocket API\n"
             f"📡 <b>Precios:</b> WebSocket (ws.py)\n"
-            f"🌐 <b>Leverage (REST):</b> {'vía Fixie' if FIXIE_URL else '⚠️ sin proxy configurado'}\n"
+            f"🌐 <b>Leverage (REST):</b> {f'vía proxy ({len(PROXY_URLS)} IP(s), failover automático)' if PROXY_URLS else '⚠️ sin proxy configurado'}\n"
             f"🔒 <b>Cierre:</b> señal explícita o botón manual\n"
             f"⚠️ <b>Error -2019:</b> posición puede registrarse como asumida",
         )
