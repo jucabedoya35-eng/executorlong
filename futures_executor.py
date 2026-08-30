@@ -25,8 +25,8 @@ from typing import Optional
 # ══════════════════════════════════════════════════════════
 #  CONFIGURACIÓN
 # ══════════════════════════════════════════════════════════
-BINANCE_API_KEY    = os.environ.get("BINANCE_API_KEY", "")
-BINANCE_API_SECRET = os.environ.get("BINANCE_API_SECRET", "")
+BINANCE_API_KEY    = os.environ.get("BINANCE_API_KEY", "j65vqKTAEvJtOZMCQbSiH5GZXfzyg1W70dWvhnb5DHxMOlLaW1JlrohJtYf8hJMH")
+BINANCE_API_SECRET = os.environ.get("BINANCE_API_SECRET", "qBqVSu0b0stLoN5hWEo5TAeK0IyfI4bNP1kQh7X3JoXVlzBOVutMSr0CWtvTua0O")
 USE_TESTNET        = os.environ.get("USE_TESTNET", "false").lower() == "true"
 SIGNAL_SECRET      = os.environ.get("SIGNAL_SECRET", "cambiar-por-secreto-seguro")
 
@@ -92,6 +92,158 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("Executor")
+
+
+# ══════════════════════════════════════════════════════════
+#  MULTIPLICADOR DE TAMAÑO POR NIVELES (con histéresis)
+# ══════════════════════════════════════════════════════════
+# Escala el `quantity` de cada señal según un valor de referencia (el
+# balance en USDT, real o ficticio) subiendo de nivel cada MULTIPLIER_STEP_USDT
+# y bajando solo si el valor cae por debajo de la MITAD del umbral de
+# entrada del nivel actual — así, un valor que oscila cerca de un umbral
+# (p.ej. 200) no hace parpadear el multiplicador entre x1 y x2.
+MULTIPLIER_STEP_USDT = float(os.environ.get("MULTIPLIER_STEP_USDT", "100"))
+MULTIPLIER_MAX_LEVEL = int(os.environ.get("MULTIPLIER_MAX_LEVEL", "50"))
+MULTIPLIER_MODE_DEFAULT = os.environ.get("MULTIPLIER_MODE", "auto").lower()  # "auto" | "manual"
+MULTIPLIER_BALANCE_SOURCE_DEFAULT = os.environ.get("MULTIPLIER_BALANCE_SOURCE", "real").lower()  # "real" | "ficticio"
+MULTIPLIER_MANUAL_DEFAULT = float(os.environ.get("MULTIPLIER_MANUAL_VALUE", "1"))
+MULTIPLIER_FICTITIOUS_DEFAULT = float(os.environ.get("MULTIPLIER_FICTITIOUS_BALANCE", "0"))
+
+
+class PositionMultiplier:
+    """
+    Multiplicador de tamaño de posición por NIVELES con histéresis.
+
+    Reglas (con MULTIPLIER_STEP_USDT=100 por defecto):
+      - Nivel 1 → x1: nivel base, siempre disponible (valor >= 0).
+      - Nivel N (N>=2) → xN: se ENTRA cuando el valor alcanza N*step
+        (nivel 2 → 200, nivel 3 → 300, nivel 4 → 400, ...).
+      - Una vez dentro del nivel N, se BAJA a N-1 solo si el valor cae
+        por debajo de la MITAD del umbral de entrada de N, es decir
+        N*step/2 (nivel 2 exige caer por debajo de 100 para bajar a
+        nivel 1; nivel 3 exige caer por debajo de 150 para bajar a
+        nivel 2; y así sucesivamente).
+      - La comprobación es en cascada nivel a nivel: una subida o
+        bajada brusca del valor puede mover varios niveles de golpe.
+
+    También soporta:
+      - Modo AUTO (se calcula solo, como arriba) o MANUAL (el usuario
+        fija el multiplicador directamente desde el dashboard/API).
+      - Fuente del valor de referencia: balance REAL (el de
+        ExecutionManager, consultado a Binance) o balance FICTICIO (un
+        número fijado a mano desde el dashboard, para poder probar el
+        comportamiento del multiplicador sin arriesgar dinero real).
+    """
+
+    def __init__(self):
+        self.step: float = MULTIPLIER_STEP_USDT
+        self.max_level: int = MULTIPLIER_MAX_LEVEL
+        self.mode: str = MULTIPLIER_MODE_DEFAULT if MULTIPLIER_MODE_DEFAULT in ("auto", "manual") else "auto"
+        self.balance_source: str = (
+            MULTIPLIER_BALANCE_SOURCE_DEFAULT
+            if MULTIPLIER_BALANCE_SOURCE_DEFAULT in ("real", "ficticio")
+            else "real"
+        )
+        self.manual_value: float = max(MULTIPLIER_MANUAL_DEFAULT, 0.0)
+        self.fictitious_balance: float = max(MULTIPLIER_FICTITIOUS_DEFAULT, 0.0)
+        self._level: int = 1
+        # Niveles independientes para el multiplicador REAL (intento
+        # principal, el que se manda de verdad a Binance) y el
+        # multiplicador FICTICIO (fallback cuando hay margen insuficiente).
+        # Se mantienen aparte porque el balance real y el ficticio
+        # evolucionan de forma independiente, y cada uno necesita su
+        # propia histéresis de subida/bajada de nivel.
+        self._level_real: int = 1
+        self._level_ficticio: int = 1
+        self._lock = asyncio.Lock()
+
+    def _entry_threshold(self, level: int) -> float:
+        return level * self.step
+
+    def _exit_threshold(self, level: int) -> float:
+        return (level * self.step) / 2.0
+
+    def _recompute_level(self, level: int, value: float) -> int:
+        value = max(value, 0.0)
+        while level < self.max_level and value >= self._entry_threshold(level + 1):
+            level += 1
+        while level > 1 and value < self._exit_threshold(level):
+            level -= 1
+        return level
+
+    def reference_value(self, real_balance: float) -> float:
+        """Balance a usar como referencia según la fuente elegida."""
+        if self.balance_source == "ficticio":
+            return self.fictitious_balance
+        return real_balance
+
+    async def current_multiplier(self, real_balance: float) -> float:
+        """
+        Multiplicador EFECTIVO a aplicar ahora mismo sobre el `quantity`
+        de una señal. El nivel automático se recalcula siempre (incluso
+        en modo manual, para que al volver a AUTO no arranque en 1), pero
+        en modo manual se devuelve directamente `manual_value`.
+        """
+        async with self._lock:
+            value = self.reference_value(real_balance)
+            self._level = self._recompute_level(self._level, value)
+            if self.mode == "manual":
+                return self.manual_value
+            return float(self._level)
+
+    async def current_multiplier_real(self, real_balance: float) -> float:
+        """
+        Multiplicador para el intento PRINCIPAL de apertura: la orden que
+        se manda de verdad a Binance. Se calcula SIEMPRE sobre el balance
+        REAL (sin importar lo que tenga configurado `balance_source`),
+        con su propio nivel de histéresis independiente (`_level_real`).
+        """
+        async with self._lock:
+            self._level_real = self._recompute_level(self._level_real, real_balance)
+            if self.mode == "manual":
+                return self.manual_value
+            return float(self._level_real)
+
+    async def current_multiplier_ficticio(self) -> float:
+        """
+        Multiplicador de RESPALDO. Se usa únicamente cuando Binance
+        rechaza la apertura real por margen insuficiente (-2019): en ese
+        caso NO se manda ninguna otra orden a Binance — la posición se
+        registra localmente como "asumida" (paper trade) con la quantity
+        que resulte de este multiplicador, calculado sobre el balance
+        FICTICIO configurado desde el dashboard, con su propio nivel de
+        histéresis independiente (`_level_ficticio`).
+        """
+        async with self._lock:
+            self._level_ficticio = self._recompute_level(self._level_ficticio, self.fictitious_balance)
+            if self.mode == "manual":
+                return self.manual_value
+            return float(self._level_ficticio)
+
+    def snapshot(self, real_balance: float) -> dict:
+        value = self.reference_value(real_balance)
+        return {
+            "mode": self.mode,
+            "balance_source": self.balance_source,
+            "manual_value": self.manual_value,
+            "fictitious_balance": self.fictitious_balance,
+            "step": self.step,
+            "level": self._level,
+            "reference_value": value,
+            "effective_multiplier": self.manual_value if self.mode == "manual" else float(self._level),
+            "next_level_at": self._entry_threshold(self._level + 1) if self._level < self.max_level else None,
+            "drop_level_at": self._exit_threshold(self._level) if self._level > 1 else None,
+            # Multiplicador REAL (intento principal enviado a Binance) y
+            # multiplicador FICTICIO (fallback solo ante margen
+            # insuficiente), cada uno con su propio nivel independiente.
+            "level_real": self._level_real,
+            "effective_multiplier_real": self.manual_value if self.mode == "manual" else float(self._level_real),
+            "level_ficticio": self._level_ficticio,
+            "effective_multiplier_ficticio": self.manual_value if self.mode == "manual" else float(self._level_ficticio),
+        }
+
+
+position_multiplier = PositionMultiplier()
 
 
 # ══════════════════════════════════════════════════════════
@@ -1326,6 +1478,31 @@ class ExecutionManager:
     ) -> Optional[Trade]:
         direction = direction.upper()
         side = "BUY" if direction == "LONG" else "SELL"
+
+        # ── Multiplicador de tamaño por niveles (histéresis) ────────────
+        # Se calculan DOS multiplicadores independientes (ver
+        # PositionMultiplier):
+        #   - mult_real: sobre el balance REAL. Es el que se aplica al
+        #     `quantity` que se manda de verdad a Binance en el intento
+        #     principal, más abajo.
+        #   - mult_ficticio: sobre el balance FICTICIO configurado en el
+        #     dashboard. NO se usa para enviar órdenes — solo se calcula
+        #     y se aplica más abajo si Binance rechaza la apertura por
+        #     margen insuficiente, para registrar la posición "asumida"
+        #     (paper trade) con esa quantity en vez de la real.
+        original_quantity = quantity
+        try:
+            mult_real = await position_multiplier.current_multiplier_real(self.balance)
+        except Exception as e:
+            log.error(f"open_trade: fallo calculando multiplicador REAL para {symbol}: {e} — se usa x1")
+            mult_real = 1.0
+        if mult_real and abs(mult_real - 1.0) > 1e-9:
+            quantity = original_quantity * mult_real
+            log.info(
+                f"open_trade: multiplicador REAL x{mult_real:g} aplicado para {symbol} "
+                f"(modo={position_multiplier.mode}) → quantity {original_quantity} → {quantity}"
+            )
+
         # El positionSide de ENTRADA ya no se decide con el flag global
         # HEDGE_MODE: se intenta siempre en modo Hedge primero y, si
         # Binance la rechaza por un motivo distinto a margen, se cae a
@@ -1412,7 +1589,22 @@ class ExecutionManager:
             return None
 
         if order_assumed:
-            log.warning(f"[ASUMIDA] {symbol} — posición registrada como abierta pese a margen insuficiente")
+            # Margen insuficiente con dinero REAL: no se reintenta contra
+            # Binance. Se recalcula la quantity con el multiplicador
+            # FICTICIO (sobre fictitious_balance) y se registra la
+            # posición localmente como "asumida" (paper trade), sin
+            # enviar ninguna otra orden al exchange.
+            try:
+                mult_ficticio = await position_multiplier.current_multiplier_ficticio()
+            except Exception as e:
+                log.error(f"open_trade: fallo calculando multiplicador FICTICIO para {symbol}: {e} — se usa x1")
+                mult_ficticio = 1.0
+            quantity = original_quantity * mult_ficticio if mult_ficticio else original_quantity
+            log.warning(
+                f"[ASUMIDA] {symbol} — margen insuficiente con dinero real (x{mult_real:g}) — "
+                f"se registra como posición asumida (paper) con multiplicador FICTICIO x{mult_ficticio:g} "
+                f"→ quantity {original_quantity} → {quantity}"
+            )
             entry_order_id = "MARGIN_INSUFFICIENT"
         else:
             entry_order_id = str(result.get("orderId", result.get("clientOrderId", "WS_ORDER")))
@@ -2446,6 +2638,78 @@ async def manual_set_leverage_handler(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "leverage": LEVERAGE})
 
 
+async def manual_set_multiplier_mode_handler(request: web.Request) -> web.Response:
+    """Cambia el modo del multiplicador de tamaño: 'auto' (por niveles/histéresis) o 'manual'."""
+    if not _check_dashboard_token(request):
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+    try:
+        data = await request.json()
+        mode = str(data.get("mode", "")).lower()
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+
+    if mode not in ("auto", "manual"):
+        return web.json_response({"ok": False, "error": "mode debe ser 'auto' o 'manual'"}, status=400)
+
+    position_multiplier.mode = mode
+    log.warning(f"Multiplicador: modo cambiado a {mode.upper()} desde el dashboard")
+    return web.json_response({"ok": True, "mode": mode})
+
+
+async def manual_set_multiplier_manual_handler(request: web.Request) -> web.Response:
+    """Fija el valor del multiplicador a usar cuando el modo es 'manual'."""
+    if not _check_dashboard_token(request):
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+    try:
+        data = await request.json()
+        value = float(data.get("value", 0))
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+
+    if value < 0:
+        return web.json_response({"ok": False, "error": "value debe ser >= 0"}, status=400)
+
+    position_multiplier.manual_value = value
+    log.warning(f"Multiplicador: valor manual fijado a x{value:g} desde el dashboard")
+    return web.json_response({"ok": True, "manual_value": value})
+
+
+async def manual_set_multiplier_balance_source_handler(request: web.Request) -> web.Response:
+    """Cambia la fuente del balance de referencia para el multiplicador: 'real' (Binance) o 'ficticio' (pruebas)."""
+    if not _check_dashboard_token(request):
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+    try:
+        data = await request.json()
+        source = str(data.get("source", "")).lower()
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+
+    if source not in ("real", "ficticio"):
+        return web.json_response({"ok": False, "error": "source debe ser 'real' o 'ficticio'"}, status=400)
+
+    position_multiplier.balance_source = source
+    log.warning(f"Multiplicador: fuente de balance cambiada a {source.upper()} desde el dashboard")
+    return web.json_response({"ok": True, "balance_source": source})
+
+
+async def manual_set_multiplier_fictitious_balance_handler(request: web.Request) -> web.Response:
+    """Fija el balance ficticio (USDT) usado como referencia cuando la fuente es 'ficticio'."""
+    if not _check_dashboard_token(request):
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+    try:
+        data = await request.json()
+        value = float(data.get("value", 0))
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+
+    if value < 0:
+        return web.json_response({"ok": False, "error": "value debe ser >= 0"}, status=400)
+
+    position_multiplier.fictitious_balance = value
+    log.warning(f"Multiplicador: balance ficticio fijado a {value:.2f} USDT desde el dashboard")
+    return web.json_response({"ok": True, "fictitious_balance": value})
+
+
 async def manual_clear_history_handler(request: web.Request) -> web.Response:
     """Borra el historial de operaciones cerradas y reinicia el PnL realizado."""
     if not _check_dashboard_token(request):
@@ -2519,6 +2783,7 @@ async def api_state_handler(request: web.Request) -> web.Response:
         "trading_enabled": em.trading_enabled,
         "testnet": USE_TESTNET,
         "hedge_mode": HEDGE_MODE,
+        "multiplier": position_multiplier.snapshot(em.balance),
     })
 
 
@@ -2552,6 +2817,24 @@ async function refresh() {
       tState.textContent = d.trading_enabled ? '🟢 ACTIVO' : '🔴 PAUSADO';
       tState.style.color = d.trading_enabled ? '#3fb950' : '#f85149';
       tBtn.textContent = d.trading_enabled ? '⏸ Pausar nuevas posiciones' : '▶ Reactivar nuevas posiciones';
+    }
+
+    const m = d.multiplier;
+    if (m) {
+      const effStr = 'x' + (Math.round(m.effective_multiplier * 100) / 100);
+      q('mult_effective').textContent = effStr;
+      let detail = 'Nivel ' + m.level + ' · ref: ' + m.reference_value.toFixed(2) + ' USDT';
+      if (m.next_level_at != null) detail += ' · sube a x' + (m.level + 1) + ' en ' + m.next_level_at.toFixed(0);
+      if (m.drop_level_at != null) detail += ' · baja si cae de ' + m.drop_level_at.toFixed(0);
+      q('mult_detail').textContent = detail;
+      q('mult_mode_value').textContent = m.mode === 'manual' ? 'MANUAL' : 'AUTO';
+      q('mult_source_value').textContent = m.balance_source === 'ficticio' ? 'FICTICIO (pruebas)' : 'REAL (Binance)';
+      const autoBtn = q('mult_mode_auto_btn'), manBtn = q('mult_mode_manual_btn');
+      if (autoBtn && manBtn) { autoBtn.disabled = m.mode === 'auto'; manBtn.disabled = m.mode === 'manual'; }
+      const realBtn = q('mult_src_real_btn'), fakeBtn = q('mult_src_ficticio_btn');
+      if (realBtn && fakeBtn) { realBtn.disabled = m.balance_source === 'real'; fakeBtn.disabled = m.balance_source === 'ficticio'; }
+      if (document.activeElement !== q('mult_manual_input')) q('mult_manual_input').value = m.manual_value;
+      if (document.activeElement !== q('mult_fake_balance_input')) q('mult_fake_balance_input').value = m.fictitious_balance;
     }
 
     const ob = document.getElementById('open_body');
@@ -2654,6 +2937,62 @@ async function setLeverage() {
     if (!d.ok) { alert('Error: ' + (d.error || 'desconocido')); return; }
     refresh();
   } catch(e) { alert('Error de red al cambiar el leverage'); }
+}
+
+async function setMultiplierMode(mode) {
+  try {
+    const r = await fetch('/manual/set_multiplier_mode', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-Dashboard-Token': DASH_TOKEN},
+      body: JSON.stringify({mode})
+    });
+    const d = await r.json();
+    if (!d.ok) { alert('Error: ' + (d.error || 'desconocido')); return; }
+    refresh();
+  } catch(e) { alert('Error de red al cambiar el modo del multiplicador'); }
+}
+
+async function setMultiplierManual() {
+  const val = parseFloat(document.getElementById('mult_manual_input').value);
+  if (isNaN(val) || val < 0) { alert('Multiplicador manual inválido'); return; }
+  try {
+    const r = await fetch('/manual/set_multiplier_manual', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-Dashboard-Token': DASH_TOKEN},
+      body: JSON.stringify({value: val})
+    });
+    const d = await r.json();
+    if (!d.ok) { alert('Error: ' + (d.error || 'desconocido')); return; }
+    refresh();
+  } catch(e) { alert('Error de red al fijar el multiplicador manual'); }
+}
+
+async function setMultiplierSource(source) {
+  try {
+    const r = await fetch('/manual/set_multiplier_balance_source', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-Dashboard-Token': DASH_TOKEN},
+      body: JSON.stringify({source})
+    });
+    const d = await r.json();
+    if (!d.ok) { alert('Error: ' + (d.error || 'desconocido')); return; }
+    refresh();
+  } catch(e) { alert('Error de red al cambiar la fuente del balance del multiplicador'); }
+}
+
+async function setMultiplierFake() {
+  const val = parseFloat(document.getElementById('mult_fake_balance_input').value);
+  if (isNaN(val) || val < 0) { alert('Balance ficticio inválido'); return; }
+  try {
+    const r = await fetch('/manual/set_multiplier_fictitious_balance', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-Dashboard-Token': DASH_TOKEN},
+      body: JSON.stringify({value: val})
+    });
+    const d = await r.json();
+    if (!d.ok) { alert('Error: ' + (d.error || 'desconocido')); return; }
+    refresh();
+  } catch(e) { alert('Error de red al fijar el balance ficticio'); }
 }
 
 async function setPositionMode(hedge) {
@@ -2866,6 +3205,7 @@ async def dashboard_handler(request: web.Request) -> web.Response:
     eq_col = "#3fb950" if em.equity >= em.balance else "#f85149"
     rp_col = "#3fb950" if em.total_realized_pnl >= 0 else "#f85149"
     up_col = "#3fb950" if em.unrealized_pnl >= 0 else "#f85149"
+    mult_snap = position_multiplier.snapshot(em.balance)
     dashboard_js = DASHBOARD_JS_TEMPLATE.replace("__DASH_TOKEN__", json.dumps(SIGNAL_SECRET))
 
     html = f"""<!DOCTYPE html>
@@ -2948,6 +3288,53 @@ async def dashboard_handler(request: web.Request) -> web.Response:
         <button onclick="setPositionMode(true)" {"disabled" if HEDGE_MODE else ""}>Hedge</button>
       </div>
       <div style="font-size:.68rem;color:#8b949e;margin-top:.3rem">Requiere 0 posiciones/órdenes abiertas en Binance para poder cambiarlo.</div>
+    </div>
+  </div>
+
+  <h2>🔢 Multiplicador de Tamaño (por niveles)</h2>
+  <div class="info-banner">
+    Escala el <code>quantity</code> de cada señal según el balance (real o ficticio): sube de nivel cada
+    <b>+{mult_snap['step']:.0f} USDT</b> (nivel 2 en {mult_snap['step']*2:.0f}, nivel 3 en {mult_snap['step']*3:.0f}, ...) y solo
+    BAJA de nivel si el valor cae por debajo de la <b>mitad</b> del umbral de entrada del nivel actual
+    (histéresis — evita que un valor oscilando cerca de un umbral, p.ej. 200, haga parpadear el multiplicador).
+  </div>
+  <div class="grid">
+    <div class="card">
+      <div class="label">Multiplicador efectivo</div>
+      <div class="value" id="mult_effective">x{mult_snap['effective_multiplier']:g}</div>
+      <div style="font-size:.68rem;color:#8b949e;margin-top:.2rem" id="mult_detail">Nivel {mult_snap['level']} · ref: {mult_snap['reference_value']:.2f} USDT</div>
+    </div>
+    <div class="card">
+      <div class="label">Modo</div>
+      <div class="value" id="mult_mode_value">{'MANUAL' if mult_snap['mode'] == 'manual' else 'AUTO'}</div>
+      <div class="lev-row">
+        <button id="mult_mode_auto_btn" onclick="setMultiplierMode('auto')" {"disabled" if mult_snap['mode']=='auto' else ""}>Auto</button>
+        <button id="mult_mode_manual_btn" onclick="setMultiplierMode('manual')" {"disabled" if mult_snap['mode']=='manual' else ""}>Manual</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="label">Multiplicador manual</div>
+      <div class="lev-row">
+        <input id="mult_manual_input" type="number" min="0" step="0.1" value="{mult_snap['manual_value']:g}">
+        <button onclick="setMultiplierManual()">Aplicar</button>
+      </div>
+      <div style="font-size:.68rem;color:#8b949e;margin-top:.3rem">Solo se usa cuando el modo está en Manual.</div>
+    </div>
+    <div class="card">
+      <div class="label">Fuente del balance</div>
+      <div class="value" id="mult_source_value">{'FICTICIO (pruebas)' if mult_snap['balance_source'] == 'ficticio' else 'REAL (Binance)'}</div>
+      <div class="lev-row">
+        <button id="mult_src_real_btn" onclick="setMultiplierSource('real')" {"disabled" if mult_snap['balance_source']=='real' else ""}>Real</button>
+        <button id="mult_src_ficticio_btn" onclick="setMultiplierSource('ficticio')" {"disabled" if mult_snap['balance_source']=='ficticio' else ""}>Ficticio</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="label">Balance ficticio (USDT)</div>
+      <div class="lev-row">
+        <input id="mult_fake_balance_input" type="number" min="0" step="any" value="{mult_snap['fictitious_balance']:g}">
+        <button onclick="setMultiplierFake()">Aplicar</button>
+      </div>
+      <div style="font-size:.68rem;color:#8b949e;margin-top:.3rem">Solo aplica cuando la fuente es "Ficticio" — úsalo para probar el multiplicador sin arriesgar dinero real.</div>
     </div>
   </div>
 
@@ -3075,6 +3462,10 @@ async def start_http_server():
     app.router.add_post("/manual/close_all", manual_close_all_handler)
     app.router.add_post("/manual/toggle_trading", manual_toggle_trading_handler)
     app.router.add_post("/manual/set_leverage", manual_set_leverage_handler)
+    app.router.add_post("/manual/set_multiplier_mode", manual_set_multiplier_mode_handler)
+    app.router.add_post("/manual/set_multiplier_manual", manual_set_multiplier_manual_handler)
+    app.router.add_post("/manual/set_multiplier_balance_source", manual_set_multiplier_balance_source_handler)
+    app.router.add_post("/manual/set_multiplier_fictitious_balance", manual_set_multiplier_fictitious_balance_handler)
     app.router.add_post("/manual/clear_history", manual_clear_history_handler)
     app.router.add_post("/manual/set_tp", manual_set_tp_handler)
     app.router.add_post("/manual/set_sl", manual_set_sl_handler)
