@@ -65,7 +65,7 @@ MIN_NOTIONAL_USDT = float(os.environ.get("MIN_NOTIONAL_USDT", "5.1"))
 # (no contra el precio con el que el bot calculó la cantidad): con 2% una
 # vela adversa de ~3% ya dejaba la orden por debajo de 5 USDT y disparaba
 # el rechazo -4164.
-NOTIONAL_SAFETY_BUFFER_PCT = float(os.environ.get("NOTIONAL_SAFETY_BUFFER_PCT", "5.0"))
+NOTIONAL_SAFETY_BUFFER_PCT = float(os.environ.get("NOTIONAL_SAFETY_BUFFER_PCT", "1.0"))
 MAX_PRICE_AGE_S = float(os.environ.get("MAX_PRICE_AGE_S", "5.0"))
 # Espera máxima a un tick fresco del WS antes de pasar al respaldo REST.
 # Antes eran 10 s fijos porque suscribirse implicaba reconectar (con
