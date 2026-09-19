@@ -67,6 +67,12 @@ MIN_NOTIONAL_USDT = float(os.environ.get("MIN_NOTIONAL_USDT", "5.1"))
 # el rechazo -4164.
 NOTIONAL_SAFETY_BUFFER_PCT = float(os.environ.get("NOTIONAL_SAFETY_BUFFER_PCT", "5.0"))
 MAX_PRICE_AGE_S = float(os.environ.get("MAX_PRICE_AGE_S", "5.0"))
+# Espera máxima a un tick fresco del WS antes de pasar al respaldo REST.
+# Antes eran 10 s fijos porque suscribirse implicaba reconectar (con
+# backoff de hasta 60 s). Con SUBSCRIBE en caliente basta con 3 s: si en
+# ese tiempo no llegó nada, el WS tiene un problema y el REST resuelve
+# mucho antes que seguir esperando.
+WS_PRICE_WAIT_S = float(os.environ.get("WS_PRICE_WAIT_S", "3.0"))
 MIN_VALID_PRICE = 0.00001
 
 # ── Filtros reales por símbolo (LOT_SIZE / MIN_NOTIONAL / PRICE_FILTER) ──
@@ -1541,10 +1547,47 @@ class ExecutionManager:
         return self._balance + self.unrealized_pnl
 
     def _sync_ws_symbols(self):
+        """Mantiene la lista de símbolos seguidos por el WS alineada con
+        las posiciones abiertas. Con el WS.py corregido esto es un
+        SUBSCRIBE/UNSUBSCRIBE sobre el socket ya abierto, no una
+        reconexión, así que llamarlo tras cada apertura/cierre ya no
+        interrumpe los precios del resto de posiciones."""
         try:
             self.price_ws.update_symbols(list(self.active_symbols))
         except Exception as e:
             log.error(f"_sync_ws_symbols: {e}")
+
+    async def get_rest_price(self, symbol: str) -> float:
+        """Precio de respaldo por REST PÚBLICO (/fapi/v1/premiumIndex,
+        sin firma, peso 1). Se usa sólo si el WS no entregó un tick
+        fresco: tarda ~200 ms y es infinitamente mejor que abrir con el
+        precio de la señal, que puede llevar segundos de desfase."""
+        try:
+            session = await self.api._ensure_http_session()
+            url = f"{REST_FAPI_URL}/fapi/v1/premiumIndex?symbol={symbol.upper()}"
+            attempts: list[Optional[str]] = [p for p in PROXY_URLS if not self.api._is_proxy_banned(p)] or [None]
+            for proxy_url in attempts:
+                kwargs: dict = {"timeout": aiohttp.ClientTimeout(total=5)}
+                if proxy_url:
+                    kwargs["proxy"] = proxy_url
+                try:
+                    async with session.get(url, **kwargs) as resp:
+                        text = await resp.text()
+                        if resp.status != 200:
+                            if proxy_url:
+                                self.api._note_possible_proxy_ban(proxy_url, text)
+                            else:
+                                self.api._note_possible_ip_ban(text)
+                            continue
+                        data = json.loads(text)
+                        price = float(data.get("markPrice") or 0.0)
+                        if price > 0:
+                            return price
+                except Exception:
+                    continue
+        except Exception as e:
+            log.warning(f"get_rest_price: {symbol} falló: {e}")
+        return 0.0
 
     async def get_entry_reference_price(
         self,
@@ -1553,32 +1596,22 @@ class ExecutionManager:
         fallback_price: float = 0.0,
     ) -> float:
         """
-        Resuelve el precio REAL de entrada — NUNCA confía en el `price`
-        que llega en la señal salvo como ÚLTIMO recurso (ver punto 3),
-        ya que normalmente es solo informativo/de cuando se generó la
-        señal y puede llevar segundos de desfase.
+        Resuelve el precio REAL de entrada. Orden de preferencia:
 
-        100% WebSocket — ya NO hay fallback REST de precio (get_rest_price
-        se eliminó por decisión explícita: se quitaron todas las llamadas
-        REST salvo la de leverage). Orden de preferencia:
+        1. Caché WS, si es reciente (< MAX_PRICE_AGE_S). Con el stream de
+           mercado completo de WS.py (!markPrice@arr) esto acierta
+           prácticamente siempre, incluso para un símbolo que nunca se
+           había operado — que era justo el caso que fallaba.
+        2. Suscripción en caliente + espera por evento (no por sondeo).
+           `wait_for_price` despierta en cuanto entra el tick; como ahora
+           suscribirse es un SUBSCRIBE sobre el socket abierto y no una
+           reconexión con backoff, esto se resuelve en milisegundos.
+        3. REST público (premiumIndex), ~200 ms.
+        4. Sólo si todo lo anterior falla, el precio de la señal.
 
-        1. Caché WS ya activa para el símbolo — pero SÓLO si es reciente
-           (< MAX_PRICE_AGE_S). Un precio cacheado viejo (p.ej. de una
-           posición anterior ya cerrada en ese mismo símbolo, cuyo stream
-           se desuscribió) es PEOR que no tener nada: produce un
-           entry_price completamente fuera de mercado sin ningún error
-           visible. Por eso aquí se exige freshness, no solo presencia.
-        2. Si el símbolo aún no estaba suscrito (o el dato es viejo), se
-           suscribe al WS de precios y se espera a que llegue un tick
-           fresco, re-suscribiendo periódicamente por si el símbolo se
-           cayó del stream o el primer mensaje de suscripción se perdió.
-        3. Si tras esperar el WS el tiempo máximo sigue sin entregar nada
-           Y se dispone de un `fallback_price` (típicamente el precio que
-           traía la señal de entrada), se usa ESE como último recurso en
-           vez de cancelar la apertura — dejando bien claro en el log que
-           es un precio aproximado y no confirmado contra mercado.
-           Cancelar la operación solo ocurre si no hay absolutamente
-           ningún precio disponible (ni WS ni fallback).
+        Se usa `ensure_symbols` y no `update_symbols`: esta última
+        REEMPLAZA la lista y daría de baja los símbolos de las posiciones
+        abiertas que no vinieran en la llamada.
         """
         try:
             p = self.price_ws.get_price(symbol, max_age_s=MAX_PRICE_AGE_S)
@@ -1587,48 +1620,57 @@ class ExecutionManager:
         except Exception:
             pass
 
-        def _subscribe():
-            try:
-                wanted = self.active_symbols | {symbol}
-                if extra_symbols:
-                    wanted |= set(extra_symbols)
-                self.price_ws.update_symbols(list(wanted))
-            except Exception as e:
-                log.warning(f"get_entry_reference_price: no se pudo suscribir {symbol} al WS: {e}")
+        # ── 2. Suscripción en caliente + espera por evento ──────────────
+        wanted = list(self.active_symbols | {symbol} | set(extra_symbols or []))
+        try:
+            if hasattr(self.price_ws, "ensure_symbols"):
+                self.price_ws.ensure_symbols(wanted)
+            else:   # compatibilidad con la versión antigua de WS.py
+                self.price_ws.update_symbols(wanted)
+        except Exception as e:
+            log.warning(f"get_entry_reference_price: no se pudo suscribir {symbol} al WS: {e}")
 
-        _subscribe()
-
-        # Margen de espera al tick fresco del WS antes de recurrir al
-        # fallback_price. Re-suscribe periódicamente por si el primer
-        # intento de suscripción se perdió.
-        # time.monotonic() en vez de asyncio.get_event_loop(): esta
-        # última está deprecada fuera de una corrutina en ejecución y en
-        # Python 3.12 emite DeprecationWarning.
-        deadline = time.monotonic() + 10.0
-        resub_every_s = 3.0
-        last_resub = time.monotonic()
-        while time.monotonic() < deadline:
-            await asyncio.sleep(0.2)
+        if hasattr(self.price_ws, "wait_for_price"):
             try:
-                p = self.price_ws.get_price(symbol, max_age_s=MAX_PRICE_AGE_S)
+                # to_thread: wait_for_price es bloqueante (Condition), no
+                # debe correr dentro del event loop del executor.
+                p = await asyncio.to_thread(
+                    self.price_ws.wait_for_price, symbol, WS_PRICE_WAIT_S, MAX_PRICE_AGE_S
+                )
                 if p and p > 0:
                     return float(p)
-            except Exception:
-                pass
-            now = time.monotonic()
-            if now - last_resub >= resub_every_s:
-                _subscribe()
-                last_resub = now
+            except Exception as e:
+                log.warning(f"get_entry_reference_price: wait_for_price falló para {symbol}: {e}")
+        else:
+            deadline = time.monotonic() + WS_PRICE_WAIT_S
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0.1)
+                try:
+                    p = self.price_ws.get_price(symbol, max_age_s=MAX_PRICE_AGE_S)
+                    if p and p > 0:
+                        return float(p)
+                except Exception:
+                    pass
 
-        if fallback_price and fallback_price > 0:
+        # ── 3. REST público como respaldo ───────────────────────────────
+        rest_price = await self.get_rest_price(symbol)
+        if rest_price > 0:
             log.warning(
-                f"get_entry_reference_price: {symbol} sin precio WS tras esperar — se usa el precio de la señal "
-                f"({fallback_price}) como último recurso para NO cancelar la apertura"
+                f"get_entry_reference_price: {symbol} sin tick WS en {WS_PRICE_WAIT_S:.1f}s — "
+                f"se usa el mark price por REST ({rest_price})"
+            )
+            return rest_price
+
+        # ── 4. Último recurso: el precio de la señal ────────────────────
+        if fallback_price and fallback_price > 0:
+            log.error(
+                f"get_entry_reference_price: {symbol} sin precio WS NI REST — se usa el precio de la señal "
+                f"({fallback_price}). El tamaño de la posición puede quedar descuadrado; revisa el estado del WS."
             )
             return float(fallback_price)
 
         log.error(
-            f"get_entry_reference_price: {symbol} sin precio WS y sin fallback_price disponible "
+            f"get_entry_reference_price: {symbol} sin precio WS, sin REST y sin fallback_price "
             f"— no es posible abrir sin ningún precio"
         )
         return 0.0
@@ -3902,6 +3944,15 @@ async def main():
         api = BinanceAPI(BINANCE_API_KEY, BINANCE_API_SECRET, testnet=USE_TESTNET)
         price_ws = SymbolWebSocketPriceCache([])
         price_ws.start()
+        # Esperar a que el WS de precios esté realmente conectado y
+        # suscrito antes de aceptar señales: si la primera llega con el
+        # socket a medio abrir, la apertura cae al respaldo y el tamaño
+        # puede quedar descuadrado.
+        if hasattr(price_ws, "wait_until_connected"):
+            if price_ws.wait_until_connected(timeout=20):
+                log.info("WS de precios conectado y suscrito")
+            else:
+                log.warning("WS de precios aún no conectado tras 20s — se arranca igual y seguirá reintentando")
         execution_manager = ExecutionManager(api, price_ws)
         if HEDGE_MODE:
             log.warning("HEDGE_MODE=true: asegúrate de que tu cuenta esté en Hedge Mode.")
