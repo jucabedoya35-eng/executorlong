@@ -2033,11 +2033,35 @@ class ExecutionManager:
             except Exception as e:
                 log.error(f"open_trade: fallo calculando multiplicador FICTICIO para {symbol}: {e} — se usa x1")
                 mult_ficticio = 1.0
-            quantity = original_quantity * mult_ficticio if mult_ficticio else original_quantity
+            fict_quantity = original_quantity * mult_ficticio if mult_ficticio else original_quantity
+
+            # FIX: antes se registraba `fict_quantity` TAL CUAL, sin pasar por
+            # resolve_safe_quantity. Con un símbolo de precio muy bajo eso
+            # dejaba posiciones asumidas con notional < MIN_NOTIONAL (p.ej.
+            # 15 × 0.0494 = 0.74 USDT) porque la cantidad nunca se recalculaba.
+            # Ahora se recalcula igual que en una orden real: notional deseado
+            # -> qty con step efectivo -> se sube hasta cumplir el notional
+            # mínimo (+ colchón). Ej.: 15 -> ~104+ a precio 0.0494.
+            fict_desired_notional = (price if price > 0 else ref_price) * fict_quantity
+            try:
+                fict_send_qty, fict_send_notional, _fict_qty_str = resolve_safe_quantity(
+                    fict_desired_notional, ref_price, filters,
+                    extra_buffer_pct=NOTIONAL_SAFETY_BUFFER_PCT, for_market=True,
+                )
+                quantity = fict_send_qty
+            except Exception as e:
+                log.error(
+                    f"open_trade: no se pudo recalcular quantity ASUMIDA para {symbol}: {e} "
+                    f"— se usa la quantity sin ajustar {fict_quantity}"
+                )
+                quantity = fict_quantity
+                fict_send_notional = fict_quantity * ref_price
+
             log.warning(
                 f"[ASUMIDA] {symbol} — margen insuficiente con dinero real (x{mult_real:g}) — "
                 f"se registra como posición asumida (paper) con multiplicador FICTICIO x{mult_ficticio:g} "
-                f"→ quantity {original_quantity} → {quantity}"
+                f"→ quantity {original_quantity} → {fict_quantity} (ficticia) → {quantity} "
+                f"(recalculada, notional≈${fict_send_notional:.4f}, precio_ref={ref_price})"
             )
             entry_order_id = "MARGIN_INSUFFICIENT"
         else:
