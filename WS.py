@@ -72,7 +72,7 @@ _ALL_MARKET_ENABLED  = os.environ.get("WS_ALL_MARKET", "true").lower() == "true"
 _ALL_MARKET_INTERVAL = os.environ.get("WS_ALL_MARKET_INTERVAL", "3s").lower()
 _ALL_MARKET_STREAM   = "!markPrice@arr@1s" if _ALL_MARKET_INTERVAL == "1s" else "!markPrice@arr"
 
-_WS_BASE_URL = os.environ.get("WS_FSTREAM_URL", "wss://fstream.binance.com/stream")
+_WS_BASE_URL = os.environ.get("WS_FSTREAM_URL", "wss://fstream.binance.com/market/stream")
 
 
 class SymbolWebSocketPriceCache:
