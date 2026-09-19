@@ -391,11 +391,33 @@ def format_qty(value, step) -> str:
     return f"{adjusted:.{decimals}f}"
 
 
+def _effective_step(filters: dict, for_market: bool = True):
+    """Step a usar según el TIPO de orden.
+
+    Binance valida LOT_SIZE para LIMIT y MARKET_LOT_SIZE para MARKET —
+    y en no pocos símbolos (sobre todo los de precio bajo / alta
+    volatilidad, tipo BMTUSDT) el segundo es MÁS GRUESO que el primero
+    (p.ej. LOT_SIZE admite 0.1 pero MARKET_LOT_SIZE exige enteros). Si se
+    calcula la cantidad con el step de LOT_SIZE para una orden MARKET,
+    Binance la rechaza con -1111 aunque el número "parezca" válido.
+    """
+    if for_market:
+        return filters.get("market_step_size") or filters.get("stepSize", 1.0)
+    return filters.get("stepSize", 1.0)
+
+
+def _effective_min_qty(filters: dict, for_market: bool = True):
+    if for_market:
+        return filters.get("market_min_qty") or filters.get("minQty", 1.0)
+    return filters.get("minQty", 1.0)
+
+
 def resolve_safe_quantity(
     desired_notional: float,
     price: float,
     filters: dict,
     extra_buffer_pct: float = 0.0,
+    for_market: bool = True,
 ) -> tuple[float, float, str]:
     """
     Calcula la cantidad final a enviar a Binance a partir de un notional
@@ -403,11 +425,17 @@ def resolve_safe_quantity(
     de confiar ciegamente en la `quantity` que llega en la señal.
 
     - Convierte notional -> quantity con el precio más fresco disponible.
-    - Redondea SIEMPRE HACIA ARRIBA al stepSize (LOT_SIZE) del símbolo:
-      hacia abajo se pierde hasta un step entero y el notional se queda
-      corto (-4164); hacia arriba, como mucho, se paga un step de más.
+    - Usa el step EFECTIVO según el tipo de orden: MARKET_LOT_SIZE para
+      MARKET (`for_market=True`, el caso normal de apertura/cierre) o
+      LOT_SIZE para LIMIT (`for_market=False`) — ver `_effective_step`.
     - Sube la cantidad hasta que el notional cumpla el mínimo exigido
       (MIN_NOTIONAL_USDT o el real del símbolo, con colchón).
+    - REGLA EXPLÍCITA: si la cantidad calculada por step no alcanza el
+      notional mínimo, la corrección SIEMPRE escala a una cantidad
+      ENTERA (nunca "15.3" → sí "16", nunca "16.0" → sí "16"), no a un
+      múltiplo fraccionario de step. Esto es más conservador que el
+      mínimo estrictamente necesario, pero elimina cualquier ambigüedad
+      de precisión justo en el punto donde Binance es más estricto.
     - Devuelve TAMBIÉN el string ya formateado que se va a enviar, y
       valida el notional sobre ESE string — no sobre un float intermedio
       que luego el formateo podía recortar.
@@ -424,10 +452,10 @@ def resolve_safe_quantity(
     # fallback universalmente seguro frente a -1111. Cuando
     # USE_EXCHANGE_INFO está activo esto casi nunca se usa, porque se
     # conoce el stepSize de verdad.
-    d_step = _to_decimal(filters.get("stepSize", 1.0), "1")
+    d_step = _to_decimal(_effective_step(filters, for_market), "1")
     if d_step <= 0:
         d_step = Decimal("1")
-    d_min_qty = _to_decimal(filters.get("minQty", d_step), "0")
+    d_min_qty = _to_decimal(_effective_min_qty(filters, for_market), "0")
 
     d_min_notional = max(
         _to_decimal(filters.get("min_notional", MIN_NOTIONAL_USDT)),
@@ -442,16 +470,33 @@ def resolve_safe_quantity(
     if qty < d_min_qty:
         qty = ceil_to_step(d_min_qty, d_step)
 
-    # Verificación final SOBRE EL STRING que realmente se va a enviar.
-    # Se sube de step en step hasta que el notional del string cumpla el
-    # mínimo. El bucle está acotado: cada iteración añade un step, y el
-    # primer cálculo ya deja la cantidad prácticamente en el objetivo.
     qty_str = format_qty(qty, d_step)
-    guard = 0
-    while _to_decimal(qty_str) * d_price < d_min_notional and guard < 1000:
-        qty = _to_decimal(qty_str) + d_step
-        qty_str = format_qty(qty, d_step)
-        guard += 1
+
+    # ── Corrección por notional insuficiente: SIEMPRE a un entero ───────
+    # No se sigue sumando `step` (podía producir 15.1, 15.2, 15.3...):
+    # se salta directo al primer NÚMERO ENTERO cuyo notional cumpla el
+    # mínimo, y sólo si el step real exige múltiplos más gruesos que 1
+    # (p.ej. step=10) se sube ese entero al múltiplo válido siguiente.
+    if _to_decimal(qty_str) * d_price < d_min_notional:
+        one = Decimal("1")
+        qty_int = ceil_to_step(d_min_notional / d_price, one)
+        step_for_int = d_step if d_step > one else one
+        if step_for_int != one:
+            qty_int = ceil_to_step(qty_int, step_for_int)
+        if qty_int < d_min_qty:
+            qty_int = ceil_to_step(d_min_qty, step_for_int)
+        qty_str = format_qty(qty_int, step_for_int)
+
+        # Red de seguridad: precios extremadamente bajos donde ni ceil()
+        # alcanzó (redondeos de borde). Se sube de unidad entera en
+        # unidad entera — nunca de step fraccionario — hasta cumplir.
+        guard = 0
+        while _to_decimal(qty_str) * d_price < d_min_notional and guard < 1000:
+            qty_int = _to_decimal(qty_str) + step_for_int
+            qty_str = format_qty(qty_int, step_for_int)
+            guard += 1
+
+        d_step = step_for_int  # para el tope de maxQty más abajo
 
     final_qty = _to_decimal(qty_str)
 
@@ -502,6 +547,14 @@ class Trade:
     # posición (ver ExecutionManager._place_entry_order). Se usa luego
     # para cerrar / poner TP-SL con el positionSide correcto.
     hedge_mode: bool = True
+    # NUEVO: marca si el último `current_price`/pnl_usdt viene de un tick
+    # realmente fresco del WS (< MAX_PRICE_AGE_S) o si es el último dato
+    # conocido porque el feed dejó de actualizar. Sin esto, el dashboard
+    # no tenía forma de distinguir "el precio no se mueve" de "el precio
+    # dejó de llegar" — ambos se veían idénticos (número congelado).
+    price_stale: bool = False
+    price_age_s: float = 0.0
+    last_price_update: float = 0.0
 
     @property
     def notional_usdt(self) -> float:
@@ -1206,6 +1259,7 @@ class BinanceAPI:
     # símbolo de precio alto dispara el notional a cientos de dólares.
     SAFE_DEFAULT_FILTERS: dict = {
         "stepSize": 1.0,
+        "market_step_size": 1.0,
         "minQty": 1.0,
         "tickSize": 0.0,
         "qty_precision": 0,
@@ -1261,13 +1315,26 @@ class BinanceAPI:
                 parsed["minQty"] = f.get("minQty", parsed["minQty"])
                 parsed["maxQty"] = f.get("maxQty")
             elif ftype == "MARKET_LOT_SIZE":
-                # Para órdenes MARKET manda este filtro, no LOT_SIZE.
+                # Para órdenes MARKET (y para STOP_MARKET/TAKE_PROFIT_MARKET,
+                # que se ejecutan como MARKET al dispararse) Binance valida
+                # ESTE filtro, no LOT_SIZE. En muchos símbolos de precio bajo
+                # / alta volatilidad el step de MARKET_LOT_SIZE es más
+                # GRUESO que el de LOT_SIZE (p.ej. LOT_SIZE admite 0.1 pero
+                # MARKET_LOT_SIZE exige enteros) — usar el de LOT_SIZE aquí
+                # era la causa real de los -1111 en cantidades que "parecían"
+                # válidas (15.3 en vez de 16).
+                parsed["market_step_size"] = f.get("stepSize", parsed.get("stepSize"))
                 parsed["market_min_qty"] = f.get("minQty")
                 parsed["market_max_qty"] = f.get("maxQty")
             elif ftype == "MIN_NOTIONAL":
                 parsed["min_notional"] = f.get("notional", parsed["min_notional"])
             elif ftype == "PRICE_FILTER":
                 parsed["tickSize"] = f.get("tickSize", parsed["tickSize"])
+        # Si el símbolo no trae MARKET_LOT_SIZE (poco común en futuros,
+        # pero por si acaso), se cae al step de LOT_SIZE.
+        parsed.setdefault("market_step_size", parsed.get("stepSize"))
+        if not parsed.get("market_step_size"):
+            parsed["market_step_size"] = parsed.get("stepSize", 1.0)
         parsed["qty_precision"] = _step_decimals(parsed.get("stepSize", 1.0))
         # El notional mínimo efectivo nunca baja del configurado por el
         # usuario (MIN_NOTIONAL_USDT), que ya lleva su propio margen.
@@ -1739,7 +1806,7 @@ class ExecutionManager:
             target_notional = max(target_notional, min_notional)
 
             retry_qty, retry_notional, retry_qty_str = resolve_safe_quantity(
-                target_notional, fresh_price, filters, extra_buffer_pct=retry_buffer
+                target_notional, fresh_price, filters, extra_buffer_pct=retry_buffer, for_market=True,
             )
 
             log.info(f"_place_market_order_safe: reintento {symbol} qty={retry_qty_str} (notional≈${retry_notional:.4f}, precio={fresh_price})")
@@ -1914,7 +1981,8 @@ class ExecutionManager:
             # formatear después: ese doble formateo era justo lo que
             # podía recortar la cantidad por debajo de lo validado.
             send_qty, send_notional, qty_str = resolve_safe_quantity(
-                desired_notional, ref_price, filters, extra_buffer_pct=NOTIONAL_SAFETY_BUFFER_PCT
+                desired_notional, ref_price, filters,
+                extra_buffer_pct=NOTIONAL_SAFETY_BUFFER_PCT, for_market=True,
             )
         except Exception as e:
             log.error(f"open_trade: no se pudo calcular quantity segura para {symbol}: {e}")
@@ -1935,7 +2003,7 @@ class ExecutionManager:
             log.info(
                 f"open_trade: quantity ajustada para {symbol} → señal={quantity} (notional≈${desired_notional:.4f}) "
                 f"→ enviada={qty_str} (notional≈${send_notional:.4f}, precio_ref={ref_price}, "
-                f"stepSize={filters.get('stepSize')}, minNotional={min_notional_req})"
+                f"marketStepSize={_effective_step(filters, True)}, minNotional={min_notional_req})"
             )
         quantity = send_qty
 
@@ -2026,6 +2094,7 @@ class ExecutionManager:
                         current_price=filled_price,
                         order_assumed=order_assumed,
                         hedge_mode=True,
+                        last_price_update=time.time(),
                     )
                     self._trades[key] = trade
                     self._paper_id_map[paper_trade_id] = key
@@ -2041,6 +2110,8 @@ class ExecutionManager:
                     existing.entry_order_id = entry_order_id
                     existing.order_assumed = existing.order_assumed or order_assumed
                     existing.hedge_mode = True
+                    existing.last_price_update = time.time()
+                    existing.price_stale = False
                     self._paper_id_map[paper_trade_id] = key
                     trade = existing
                     action_tag = "AMPLIADO"
@@ -2069,6 +2140,7 @@ class ExecutionManager:
                         current_price=filled_price,
                         order_assumed=order_assumed,
                         hedge_mode=False,
+                        last_price_update=time.time(),
                     )
                     self._trades[key] = trade
                     self._paper_id_map[paper_trade_id] = key
@@ -2113,6 +2185,8 @@ class ExecutionManager:
                         existing.entry_order_id = entry_order_id
                         existing.order_assumed = existing.order_assumed or order_assumed
                         existing.hedge_mode = False
+                        existing.last_price_update = time.time()
+                        existing.price_stale = False
 
                         new_key = (symbol, new_direction)
                         if new_key != old_key:
@@ -2178,12 +2252,14 @@ class ExecutionManager:
             await self.api.cancel_symbol_orders(trade.symbol)
         except Exception as e:
             log.warning(f"force_close: no se pudieron cancelar órdenes previas de {trade.symbol}: {e}")
-        # La cantidad de cierre también debe respetar el stepSize, y
-        # redondeando HACIA ABAJO: pedir cerrar más de lo que hay en la
-        # posición hace que Binance rechace la orden reduceOnly.
+        # close_position_market manda una orden MARKET: debe redondear al
+        # step de MARKET_LOT_SIZE (no LOT_SIZE), que en varios símbolos es
+        # más grueso — usar el de LOT_SIZE aquí también podía rechazar el
+        # cierre con -1111. Redondea HACIA ABAJO: pedir cerrar más de lo
+        # que hay en la posición hace que Binance rechace el reduceOnly.
         try:
             close_filters = await self.api.get_symbol_filters(trade.symbol)
-            close_step = close_filters.get("stepSize", 1.0)
+            close_step = _effective_step(close_filters, for_market=True)
             close_qty_dec = floor_to_step(trade.quantity, close_step)
             if close_qty_dec <= 0:
                 close_qty_dec = _to_decimal(trade.quantity)
@@ -2436,13 +2512,48 @@ async def balance_sync_loop():
 #  SYNC DE PRECIOS
 # ══════════════════════════════════════════════════════════
 async def price_sync_loop():
-    log.info("Price Sync Loop — actualizando PnL desde caché WS cada 1s")
+    """Actualiza PnL/ROI desde la caché WS cada 1 s.
+
+    BUG CORREGIDO: `get_price(symbol)` se llamaba SIN `max_age_s`, así
+    que si el WS dejaba de recibir ticks para un símbolo (una caída
+    puntual, un símbolo que se cayó de la suscripción, etc.) esta función
+    seguía devolviendo el ÚLTIMO precio cacheado indefinidamente. El
+    resultado era exactamente lo reportado: el precio y el PnL se
+    quedaban "pegados" en un valor, sin ningún indicio de que el dato ya
+    no era en vivo — parecía que el mercado no se movía, cuando en
+    realidad el feed se había detenido.
+
+    Ahora se exige frescura (`max_age_s=MAX_PRICE_AGE_S`) y, si no hay
+    tick fresco, el trade se marca `price_stale=True` en vez de fingir
+    que todo sigue normal. El dashboard usa ese flag para avisar.
+    """
+    log.info(f"Price Sync Loop — actualizando PnL desde caché WS cada 1s (frescura máx. {MAX_PRICE_AGE_S:.0f}s)")
+    stale_alerted: set[str] = set()
+
     while True:
         try:
+            now = time.time()
             for trade in execution_manager.open_trades:
-                price = execution_manager.price_ws.get_price(trade.symbol)
+                price = execution_manager.price_ws.get_price(trade.symbol, max_age_s=MAX_PRICE_AGE_S)
                 if price:
                     trade.update_unrealized(price)
+                    trade.price_stale = False
+                    trade.price_age_s = 0.0
+                    trade.last_price_update = now
+                    stale_alerted.discard(trade.symbol)
+                else:
+                    # Sin tick fresco: NO se inventa un precio ni se deja
+                    # el número anterior sin marcar. Se calcula cuánto
+                    # lleva sin actualizar para que el dashboard lo
+                    # muestre ("desactualizado hace Ns").
+                    trade.price_stale = True
+                    trade.price_age_s = (now - trade.last_price_update) if trade.last_price_update else 0.0
+                    if trade.symbol not in stale_alerted and trade.price_age_s > MAX_PRICE_AGE_S * 3:
+                        stale_alerted.add(trade.symbol)
+                        log.warning(
+                            f"price_sync_loop: {trade.symbol} sin precio fresco desde hace "
+                            f"{trade.price_age_s:.0f}s — el WS puede haber perdido la suscripción"
+                        )
         except Exception as e:
             log.error(f"price_sync_loop: {e}")
         await asyncio.sleep(1)
@@ -2683,17 +2794,18 @@ async def _algo_set_tp_sl(trade: "Trade", trigger_price: float, order_type: str)
     except Exception as e:
         log.warning(f"_algo_set_tp_sl: no se pudo limpiar {order_type} previo de {symbol}: {e}")
 
-    # Filtros reales del símbolo. Antes se usaba SAFE_DEFAULT_FILTERS
-    # (stepSize=1) y se redondeaba la cantidad de la posición a un ENTERO:
-    # en un símbolo con posición de 0.4 unidades el TP/SL salía con
-    # quantity=1 (o se rechazaba), y con 12.6 cerraba de más o de menos.
+    # Filtros reales del símbolo. STOP_MARKET/TAKE_PROFIT_MARKET se
+    # ejecutan como MARKET al dispararse, así que Binance valida su
+    # cantidad contra MARKET_LOT_SIZE, no LOT_SIZE — usar el step de
+    # LOT_SIZE aquí podía rechazar el TP/SL con -1111 igual que en la
+    # entrada.
     filters = await execution_manager.api.get_symbol_filters(symbol)
-    step = filters.get("stepSize", 1.0)
+    step = _effective_step(filters, for_market=True)
     # Para cerrar hay que redondear HACIA ABAJO: pedir más cantidad de la
     # que existe en la posición hace que Binance rechace el reduceOnly.
     qty_dec = floor_to_step(trade.quantity, step)
     if qty_dec <= 0:
-        qty_dec = _to_decimal(filters.get("minQty", step))
+        qty_dec = _to_decimal(_effective_min_qty(filters, for_market=True))
     qty_str = f"{qty_dec:.{_step_decimals(step)}f}"
 
     # El triggerPrice también debe respetar el tickSize del símbolo o
@@ -2833,11 +2945,11 @@ async def manual_limit_order_handler(request: web.Request) -> web.Response:
     trade = execution_manager.get_trade(symbol, data.get("direction"))
     pos_side = (trade.direction if trade.hedge_mode else "BOTH") if trade else ("BOTH" if not HEDGE_MODE else None)
 
-    # Ajuste a stepSize/tickSize reales: sin esto, una LIMIT manual con
-    # decimales "a ojo" se rechaza con -1111 / -1013.
+    # LIMIT usa LOT_SIZE (no MARKET_LOT_SIZE): son órdenes distintas y
+    # Binance valida cada una contra su propio filtro de tamaño.
     try:
         lim_filters = await execution_manager.api.get_symbol_filters(symbol)
-        qty_send = format_qty(quantity, lim_filters.get("stepSize", 1.0))
+        qty_send = format_qty(quantity, _effective_step(lim_filters, for_market=False))
         tick = lim_filters.get("tickSize", 0.0)
         price_send = round_price_to_tick(price, tick, side_up=(side == "SELL")) if tick else _plain_decimal(price)
     except Exception as e:
@@ -3177,6 +3289,10 @@ async def api_state_handler(request: web.Request) -> web.Response:
             "roi_pct": t.roi_pct,
             "order_assumed": t.order_assumed,
             "entry_order_id": t.entry_order_id,
+            # NUEVO: para que el dashboard distinga "precio en vivo" de
+            # "última cotización conocida porque el feed se detuvo".
+            "price_stale": t.price_stale,
+            "price_age_s": round(t.price_age_s, 1),
         }
 
     closed = em.closed_trades
@@ -3203,6 +3319,11 @@ async def api_state_handler(request: web.Request) -> web.Response:
         "testnet": USE_TESTNET,
         "hedge_mode": HEDGE_MODE,
         "multiplier": position_multiplier.snapshot(em.balance),
+        # NUEVO: diagnóstico para el watchdog del dashboard — con esto el
+        # front puede avisar "servidor OK pero WS de precios caído" en
+        # vez de simplemente dejar de refrescar sin explicación.
+        "server_time": time.time(),
+        "ws_price_connected": em.price_ws.is_connected() if hasattr(em.price_ws, "is_connected") else None,
     })
 
 
@@ -3210,26 +3331,91 @@ DASHBOARD_JS_TEMPLATE = """
 <script>
 const DASH_TOKEN = __DASH_TOKEN__;
 
+// Recuerda el último precio mostrado por símbolo+dirección, para poder
+// aplicar un parpadeo verde/rojo SOLO cuando el número realmente cambió
+// (y no en cada refresco, que se sentiría como ruido constante).
+const _lastPrices = {};
+// Watchdog de conexión: cuenta fallos consecutivos de /api/state. Tras
+// varios seguidos se muestra el banner — antes, un fetch que fallaba
+// (red, 500, JSON roto) sólo hacía console.error y la página se quedaba
+// mostrando los últimos datos sin ningún aviso ("se queda pegado").
+let _consecutiveFails = 0;
+let _lastOkAt = 0;
+
+function _pnlClass(value) {
+  return value >= 0 ? 'pos' : 'neg';
+}
+
+function _fmtPnl(value, decimals) {
+  const s = value.toFixed(decimals);
+  return value >= 0 ? '+' + s : s;
+}
+
+function _staleBadge(t) {
+  if (!t.price_stale) return '';
+  const age = t.price_age_s != null ? t.price_age_s.toFixed(0) + 's' : '?';
+  return `<span class="stale-badge" title="Sin cotización fresca del WS desde hace ${age}. El precio y el PnL mostrados son los últimos conocidos, no en vivo.">⚠ desactualizado ${age}</span>`;
+}
+
+function _showConnBanner(show) {
+  const b = document.getElementById('conn_banner');
+  if (b) b.style.display = show ? 'block' : 'none';
+}
+
 async function refresh() {
+  let d;
   try {
-    const r = await fetch('/api/state');
-    const d = await r.json();
-    const q = id => document.getElementById(id);
+    const r = await fetch('/api/state', {cache: 'no-store'});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    d = await r.json();
+  } catch (e) {
+    console.error('refresh: fetch falló', e);
+    _consecutiveFails++;
+    // 2 fallos seguidos (con el intervalo de 2s, ~4s sin respuesta) ya
+    // es suficiente para avisar: es mejor un falso positivo ocasional
+    // que dejar al usuario pensando que todo sigue en vivo.
+    if (_consecutiveFails >= 2) _showConnBanner(true);
+    return;
+  }
+  _consecutiveFails = 0;
+  _lastOkAt = Date.now();
+  _showConnBanner(false);
 
-    q('bal').textContent = d.balance.toFixed(2) + ' USDT';
-    q('eq').textContent = d.equity.toFixed(2) + ' USDT';
-    q('rpnl').textContent = (d.realized_pnl >= 0 ? '+' : '') + d.realized_pnl.toFixed(4) + ' USDT';
-    q('upnl').textContent = (d.unrealized_pnl >= 0 ? '+' : '') + d.unrealized_pnl.toFixed(4) + ' USDT';
-    q('wr').textContent = d.win_rate != null ? d.win_rate.toFixed(1) + '% (' + d.wins + '✅/' + d.losses + '❌)' : 'N/A';
-    q('pos').textContent = d.open_count + ' — ' + d.open_longs + 'L / ' + d.open_shorts + 'S';
-    q('lev').textContent = d.leverage + 'x';
-    q('sig_rx').textContent = d.executor_status.signals_received;
-    q('sig_ok').textContent = d.executor_status.signals_open + ' abiertas / ' + d.executor_status.signals_close + ' cerradas';
-    q('sig_rej').textContent = d.executor_status.signals_rejected;
-    q('last_sig').textContent = d.executor_status.last_signal_time + ' — ' + d.executor_status.last_signal_detail;
-    q('ws_sym').textContent = 'WS activo (ws api): ' + d.ws_symbols;
-    q('close_all_btn').disabled = d.open_count === 0;
+  // Cada bloque va en su propio try/catch: un campo inesperado (null,
+  // undefined) ya no puede tumbar el resto del refresco — antes, una
+  // sola excepción a mitad de función dejaba TODO lo de abajo (la
+  // tabla de posiciones, colores, etc.) sin actualizar ese ciclo, dando
+  // la sensación de que la página "se quedaba pegada".
+  const q = id => document.getElementById(id);
+  const safe = fn => { try { fn(); } catch (e) { console.error('refresh: sección falló', e); } };
 
+  safe(() => { q('bal').textContent = d.balance.toFixed(2) + ' USDT'; });
+  safe(() => { q('eq').textContent = d.equity.toFixed(2) + ' USDT'; });
+  safe(() => {
+    const el = q('rpnl');
+    el.textContent = _fmtPnl(d.realized_pnl, 4) + ' USDT';
+    el.className = _pnlClass(d.realized_pnl);
+  });
+  safe(() => {
+    const el = q('upnl');
+    el.textContent = _fmtPnl(d.unrealized_pnl, 4) + ' USDT';
+    el.className = _pnlClass(d.unrealized_pnl);
+  });
+  safe(() => { q('wr').textContent = d.win_rate != null ? d.win_rate.toFixed(1) + '% (' + d.wins + '✅/' + d.losses + '❌)' : 'N/A'; });
+  safe(() => { q('pos').textContent = d.open_count + ' — ' + d.open_longs + 'L / ' + d.open_shorts + 'S'; });
+  safe(() => { q('lev').textContent = d.leverage + 'x'; });
+  safe(() => { q('sig_rx').textContent = d.executor_status.signals_received; });
+  safe(() => { q('sig_ok').textContent = d.executor_status.signals_open + ' abiertas / ' + d.executor_status.signals_close + ' cerradas'; });
+  safe(() => { q('sig_rej').textContent = d.executor_status.signals_rejected; });
+  safe(() => { q('last_sig').textContent = d.executor_status.last_signal_time + ' — ' + d.executor_status.last_signal_detail; });
+  safe(() => {
+    const wsLabel = d.ws_price_connected === false ? ' ⚠ WS de precios desconectado' : '';
+    q('ws_sym').textContent = 'WS activo (ws api): ' + d.ws_symbols + wsLabel;
+    q('ws_sym').style.color = d.ws_price_connected === false ? '#f85149' : '#484f58';
+  });
+  safe(() => { q('close_all_btn').disabled = d.open_count === 0; });
+
+  safe(() => {
     const tState = q('trading_state');
     const tBtn = q('trading_toggle_btn');
     if (tState && tBtn) {
@@ -3237,63 +3423,86 @@ async function refresh() {
       tState.style.color = d.trading_enabled ? '#3fb950' : '#f85149';
       tBtn.textContent = d.trading_enabled ? '⏸ Pausar nuevas posiciones' : '▶ Reactivar nuevas posiciones';
     }
+  });
 
+  safe(() => {
     const m = d.multiplier;
-    if (m) {
-      const effStr = 'x' + (Math.round(m.effective_multiplier * 100) / 100);
-      q('mult_effective').textContent = effStr;
-      let detail = 'Nivel ' + m.level + ' · ref: ' + m.reference_value.toFixed(2) + ' USDT';
-      if (m.next_level_at != null) detail += ' · sube a x' + (m.level + 1) + ' en ' + m.next_level_at.toFixed(0);
-      if (m.drop_level_at != null) detail += ' · baja si cae de ' + m.drop_level_at.toFixed(0);
-      q('mult_detail').textContent = detail;
-      q('mult_mode_value').textContent = m.mode === 'manual' ? 'MANUAL' : 'AUTO';
-      q('mult_source_value').textContent = m.balance_source === 'ficticio' ? 'FICTICIO (pruebas)' : 'REAL (Binance)';
-      const autoBtn = q('mult_mode_auto_btn'), manBtn = q('mult_mode_manual_btn');
-      if (autoBtn && manBtn) { autoBtn.disabled = m.mode === 'auto'; manBtn.disabled = m.mode === 'manual'; }
-      const realBtn = q('mult_src_real_btn'), fakeBtn = q('mult_src_ficticio_btn');
-      if (realBtn && fakeBtn) { realBtn.disabled = m.balance_source === 'real'; fakeBtn.disabled = m.balance_source === 'ficticio'; }
-      if (document.activeElement !== q('mult_manual_input')) q('mult_manual_input').value = m.manual_value;
-      if (document.activeElement !== q('mult_fake_balance_input')) q('mult_fake_balance_input').value = m.fictitious_balance;
-    }
+    if (!m) return;
+    const effStr = 'x' + (Math.round(m.effective_multiplier * 100) / 100);
+    q('mult_effective').textContent = effStr;
+    let detail = 'Nivel ' + m.level + ' · ref: ' + m.reference_value.toFixed(2) + ' USDT';
+    if (m.next_level_at != null) detail += ' · sube a x' + (m.level + 1) + ' en ' + m.next_level_at.toFixed(0);
+    if (m.drop_level_at != null) detail += ' · baja si cae de ' + m.drop_level_at.toFixed(0);
+    q('mult_detail').textContent = detail;
+    q('mult_mode_value').textContent = m.mode === 'manual' ? 'MANUAL' : 'AUTO';
+    q('mult_source_value').textContent = m.balance_source === 'ficticio' ? 'FICTICIO (pruebas)' : 'REAL (Binance)';
+    const autoBtn = q('mult_mode_auto_btn'), manBtn = q('mult_mode_manual_btn');
+    if (autoBtn && manBtn) { autoBtn.disabled = m.mode === 'auto'; manBtn.disabled = m.mode === 'manual'; }
+    const realBtn = q('mult_src_real_btn'), fakeBtn = q('mult_src_ficticio_btn');
+    if (realBtn && fakeBtn) { realBtn.disabled = m.balance_source === 'real'; fakeBtn.disabled = m.balance_source === 'ficticio'; }
+    if (document.activeElement !== q('mult_manual_input')) q('mult_manual_input').value = m.manual_value;
+    if (document.activeElement !== q('mult_fake_balance_input')) q('mult_fake_balance_input').value = m.fictitious_balance;
+  });
 
+  safe(() => {
     const ob = document.getElementById('open_body');
     if (!d.open_trades.length) {
       ob.innerHTML = '<tr><td colspan="12" style="color:#8b949e;text-align:center;padding:.8rem">Sin posiciones abiertas</td></tr>';
-    } else {
-      ob.innerHTML = d.open_trades.map(t => {
-        const dir = t.direction === 'LONG' ? '🟢 LONG' : '🔴 SHORT';
-        const pnl = t.pnl_usdt >= 0 ? '+' + t.pnl_usdt.toFixed(4) : t.pnl_usdt.toFixed(4);
-        const roi = t.roi_pct >= 0 ? '+' + t.roi_pct.toFixed(2) + '%' : t.roi_pct.toFixed(2) + '%';
-        const assum = t.order_assumed ? ' ⚠️' : '';
-        return `<tr>
-          <td>#${t.id}</td><td><b>${t.symbol}</b></td><td>${dir}</td><td>${t.leverage}x</td>
-          <td>$${t.entry_price.toFixed(6)}</td><td>$${t.current_price.toFixed(6)}</td>
-          <td>${pnl}</td><td>${roi}</td>
-          <td>${t.notional.toFixed(4)} USDT</td><td>${t.quantity}</td>
-          <td>${t.open_time}${assum}</td>
-          <td><button class="btn-close" onclick="closeTrade('${t.symbol}','${t.direction}')">Cerrar</button>
-              <button class="btn-manage" onclick="openManageModal('${t.symbol}','${t.direction}',${t.entry_price},${t.quantity},${t.leverage})">⚙</button></td>
-        </tr>`;
-      }).join('');
+      return;
     }
+    ob.innerHTML = d.open_trades.map(t => {
+      const dir = t.direction === 'LONG' ? '🟢 LONG' : '🔴 SHORT';
+      const pnlClass = t.price_stale ? 'stale' : _pnlClass(t.pnl_usdt);
+      const roiClass = t.price_stale ? 'stale' : _pnlClass(t.roi_pct);
+      const priceClass = t.price_stale ? 'stale' : '';
+      const pnl = _fmtPnl(t.pnl_usdt, 4);
+      const roi = _fmtPnl(t.roi_pct, 2) + '%';
+      const assum = t.order_assumed ? ' ⚠️' : '';
 
+      // Parpadeo verde/rojo cuando el precio se mueve respecto al último
+      // valor mostrado para ESTA posición — así se ve, a simple vista,
+      // que el precio sigue vivo (y no sólo un número estático).
+      const priceKey = t.symbol + '_' + t.direction;
+      const prev = _lastPrices[priceKey];
+      let flashClass = '';
+      if (!t.price_stale && prev != null && prev !== t.current_price) {
+        flashClass = t.current_price > prev ? 'flash-up' : 'flash-down';
+      }
+      _lastPrices[priceKey] = t.current_price;
+
+      return `<tr>
+        <td>#${t.id}</td><td><b>${t.symbol}</b></td><td>${dir}</td><td>${t.leverage}x</td>
+        <td>$${t.entry_price.toFixed(6)}</td>
+        <td class="${priceClass} ${flashClass}">$${t.current_price.toFixed(6)}${_staleBadge(t)}</td>
+        <td class="${pnlClass}">${pnl}</td><td class="${roiClass}">${roi}</td>
+        <td>${t.notional.toFixed(4)} USDT</td><td>${t.quantity}</td>
+        <td>${t.open_time}${assum}</td>
+        <td><button class="btn-close" onclick="closeTrade('${t.symbol}','${t.direction}')">Cerrar</button>
+            <button class="btn-manage" onclick="openManageModal('${t.symbol}','${t.direction}',${t.entry_price},${t.quantity},${t.leverage})">⚙</button></td>
+      </tr>`;
+    }).join('');
+  });
+
+  safe(() => {
     const cb = document.getElementById('closed_body');
     const recent = d.closed_trades.slice(-30).reverse();
     if (!recent.length) {
       cb.innerHTML = '<tr><td colspan="9" style="color:#8b949e;text-align:center;padding:.8rem">Sin operaciones cerradas</td></tr>';
-    } else {
-      cb.innerHTML = recent.map(t => {
-        const pnl = t.pnl_usdt >= 0 ? '+' + t.pnl_usdt.toFixed(4) : t.pnl_usdt.toFixed(4);
-        const res = t.status;
-        return `<tr>
-          <td>#${t.id}</td><td>${t.symbol}</td><td>${t.direction}</td><td>${t.leverage}x</td>
-          <td>$${t.entry_price.toFixed(6)}</td><td>$${t.close_price.toFixed(6)}</td>
-          <td>${pnl}</td><td>${t.roi_pct.toFixed(2)}%</td>
-          <td>${res}</td>
-        </tr>`;
-      }).join('');
+      return;
     }
-  } catch(e) { console.error(e); }
+    cb.innerHTML = recent.map(t => {
+      const pnlClass = _pnlClass(t.pnl_usdt);
+      const roiClass = _pnlClass(t.roi_pct);
+      const pnl = _fmtPnl(t.pnl_usdt, 4);
+      const res = t.status;
+      return `<tr>
+        <td>#${t.id}</td><td>${t.symbol}</td><td>${t.direction}</td><td>${t.leverage}x</td>
+        <td>$${t.entry_price.toFixed(6)}</td><td>$${t.close_price.toFixed(6)}</td>
+        <td class="${pnlClass}">${pnl}</td><td class="${roiClass}">${t.roi_pct.toFixed(2)}%</td>
+        <td>${res}</td>
+      </tr>`;
+    }).join('');
+  });
 }
 
 async function closeTrade(symbol, direction) {
@@ -3608,7 +3817,19 @@ async function mmSetSymbolLeverage() {
 }
 
 refresh();
-setInterval(refresh, 5000);
+// 2s en vez de 5s: con el WS corregido (suscripción en caliente) el
+// backend ya tiene datos frescos mucho más seguido, así que vale la
+// pena que la UI los muestre antes.
+setInterval(refresh, 2000);
+
+// Si la pestaña estuvo en segundo plano (minimizada, otro tab), los
+// navegadores limitan o pausan los setInterval — al volver, el usuario
+// veía datos de hace rato hasta el siguiente tick programado. Esto
+// fuerza un refresco inmediato en cuanto la pestaña vuelve a estar
+// visible, en vez de esperar hasta 2s más.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') refresh();
+});
 </script>
 """
 
@@ -3671,10 +3892,24 @@ async def dashboard_handler(request: web.Request) -> web.Response:
     .mm-action.danger{{background:#f85149}}
     .btn-mini-close{{background:#f85149;color:#fff;border:none;border-radius:3px;padding:0 .35rem;font-size:.68rem;cursor:pointer;margin-left:.4rem}}
     #mm_orders_box{{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:.5rem;font-size:.74rem;margin-bottom:.8rem;color:#c9d1d9}}
+    /* ── Color por signo (PnL / ROI / precio) ── */
+    .pos{{color:#3fb950;font-weight:bold}}
+    .neg{{color:#f85149;font-weight:bold}}
+    .stale{{color:#8b949e !important;font-weight:normal;opacity:.75}}
+    .stale-badge{{display:inline-block;margin-left:.3rem;font-size:.68rem;color:#d29922;cursor:help}}
+    /* Parpadeo breve cuando un precio cambia, para que se note que sigue vivo */
+    @keyframes flash-up{{0%{{background:rgba(63,185,80,.35)}}100%{{background:transparent}}}}
+    @keyframes flash-down{{0%{{background:rgba(248,81,73,.35)}}100%{{background:transparent}}}}
+    .flash-up{{animation:flash-up .8s ease-out}}
+    .flash-down{{animation:flash-down .8s ease-out}}
+    /* Banner de desconexión — oculto por defecto */
+    #conn_banner{{display:none;background:#3a1414;border:1px solid #f85149;color:#ffb4ae;border-radius:8px;
+      padding:.6rem 1rem;margin-bottom:1rem;font-size:.82rem;font-weight:bold}}
   </style>
 </head>
 <body>
   <h1>⚡ Futures Executor WS — Binance USDT Perpetuos [{env}]</h1>
+  <div id="conn_banner">⚠️ Sin respuesta del servidor — los datos que ves pueden estar desactualizados. Reintentando…</div>
   <div class="info-banner">
     📡 Trading por <b>WebSocket API</b>. Precios en tiempo real vía <b>ws.py</b>. 
     Cambios de leverage por <b>REST{f' vía proxy ({len(PROXY_URLS)} IP(s))' if PROXY_URLS else ''}</b> (la WS API no lo soporta). Leverage configurado: <b>{LEVERAGE}x</b>{' | Modo Hedge' if HEDGE_MODE else ' | Modo One-way'}.
