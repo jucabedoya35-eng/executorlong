@@ -23,6 +23,32 @@ from dataclasses import dataclass
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, InvalidOperation, getcontext
 from typing import Optional
 
+# orjson: parseo/serialización de JSON varias veces más rápido que el
+# stdlib. Se usa en el camino MÁS caliente del bot: enviar la orden por
+# la WebSocket API de Binance y leer su respuesta. Cae a json normal si
+# no está instalado — no es obligatorio, sólo acelera si está disponible.
+try:
+    import orjson
+    def _fast_dumps(obj) -> str:
+        return orjson.dumps(obj).decode("utf-8")
+    _fast_loads = orjson.loads
+    _HAS_ORJSON = True
+except ImportError:
+    _fast_dumps = json.dumps
+    _fast_loads = json.loads
+    _HAS_ORJSON = False
+
+# uvloop: reemplaza el event loop por defecto de asyncio por una
+# implementación en libuv, bastante más rápida en I/O de sockets (que es
+# literalmente todo lo que hace este bot: WS de precios, WS de órdenes,
+# REST ocasional). No existe en Windows — se ignora ahí sin romper nada.
+try:
+    import uvloop
+    uvloop.install()
+    _HAS_UVLOOP = True
+except ImportError:
+    _HAS_UVLOOP = False
+
 # Precisión amplia para todo el cálculo de cantidades/precios: se trabaja
 # con Decimal (no con float) para que el redondeo al stepSize sea EXACTO.
 # Este es el origen del bug de "aproxima hacia abajo": con float,
@@ -760,7 +786,7 @@ class BinanceAPI:
 
             if msg.type == aiohttp.WSMsgType.TEXT:
                 try:
-                    data = json.loads(msg.data)
+                    data = _fast_loads(msg.data)
                 except Exception:
                     log.warning(f"WS no JSON: {msg.data!r}")
                     continue
@@ -818,7 +844,7 @@ class BinanceAPI:
 
         try:
             assert self._ws is not None
-            await self._ws.send_json(payload)
+            await self._ws.send_json(payload, dumps=_fast_dumps)
         except Exception as e:
             self._pending.pop(req_id, None)
             if _retry:
@@ -4174,6 +4200,10 @@ async def main():
     log.info(f"║   Entorno: {env_tag:<44}║")
     log.info(f"║   Leverage: {LEVERAGE}x | Poll cierre ext.: {POSITION_POLL_S}s              ║")
     log.info("╚══════════════════════════════════════════════════════╝")
+    log.info(
+        f"Aceleradores activos → uvloop: {'sí' if _HAS_UVLOOP else 'NO (pip install uvloop)'} | "
+        f"orjson: {'sí' if _HAS_ORJSON else 'NO (pip install orjson)'}"
+    )
     if PROXY_URLS:
         _labels = ", ".join(BinanceAPI._proxy_label(p) for p in PROXY_URLS)
         log.info(
