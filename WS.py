@@ -1,22 +1,44 @@
 """
 WS.py — Caché de precios por WebSocket para Binance USDⓈ-M Futures.
 
-REESCRITO para eliminar la latencia de suscripción que provocaba
-"sin precio WS tras esperar" al abrir una posición en un símbolo nuevo.
+REESCRITO (v3) para dar precio de verdad "en ms" a cientos de símbolos a
+la vez, dentro del límite de 1024 streams/conexión de Binance.
 
-Qué cambió, en una línea: antes, añadir un símbolo CERRABA las dos
-conexiones y las reabría desde cero (con backoff que llegaba a 60 s);
-ahora se manda un SUBSCRIBE por el socket que ya está abierto, y además
-hay un stream de mercado completo que mantiene un precio disponible para
-CUALQUIER símbolo desde el segundo cero.
+El cambio clave respecto a la versión anterior: <symbol>@markPrice@1s y
+<symbol>@ticker sólo refrescan cada 1 s COMO MÍNIMO (es el intervalo que
+Binance genera internamente, no algo que se pueda bajar). Para tener
+frescura real de milisegundos hace falta un stream que empuje en cuanto
+cambia algo en el book, y ESE es <symbol>@bookTicker: Binance lo manda en
+tiempo real, en el instante en que se mueve el mejor bid/ask — no hay
+"intervalo" que esperar. Y ocupa UN solo stream por símbolo (antes eran
+DOS: markPrice@1s + ticker), así que cambiar a bookTicker no sólo da más
+frescura, además dejar sitio para seguir más símbolos.
+
+  ⚠️ Importante: "!bookTicker" (la versión "todos los símbolos en un solo
+  stream") dejó de ser tiempo real en diciembre de 2023 — Binance lo bajó
+  a cada 5 s. Por eso aquí se abre <symbol>@bookTicker INDIVIDUAL por
+  cada símbolo seguido (que sigue siendo tiempo real), no la versión
+  "!bookTicker" agregada.
 
 Streams:
-  • !markPrice@arr        → mark price de TODOS los símbolos (cada 3 s).
-                            Es lo que hace que un símbolo nuevo tenga
-                            precio de inmediato, sin esperar suscripción.
-                            Desactivable con WS_ALL_MARKET=false.
-  • <symbol>@markPrice@1s → 1 s de frescura para los símbolos seguidos.
-  • <symbol>@ticker       → cambio 24 h, high/low, volumen.
+  • !markPrice@arr    → mark price de TODOS los símbolos (1 stream, cada
+                        1-3 s). Red de seguridad: da un precio para
+                        CUALQUIER símbolo desde el segundo cero, incluso
+                        uno que no se sigue todavía. Usado también para
+                        funding rate. Desactivable con WS_ALL_MARKET=false.
+  • !ticker@arr       → cambio 24h / high / low / volumen de TODOS los
+                        símbolos (1 stream, ~1 s). Sustituye a pedir
+                        <symbol>@ticker uno por uno.
+  • <symbol>@bookTicker → mejor bid/ask en tiempo real (sin intervalo)
+                        SOLO para los símbolos seguidos (posiciones
+                        abiertas + los que se estén resolviendo). Es la
+                        fuente de precio "fresco de verdad" que usa
+                        get_price()/wait_for_price(): se guarda el mid
+                        (bid+ask)/2 como último precio.
+
+Con esto, 600 símbolos = 600 streams de bookTicker + 2 streams globales
+= 602, bien por debajo del límite de 1024 (antes, con 2 streams por
+símbolo, 600 símbolos ni siquiera cabían: 1201 > 1024).
 
 API pública (compatible con la versión anterior):
   start() / stop()
@@ -24,19 +46,30 @@ API pública (compatible con la versión anterior):
   ensure_symbols(symbols)            — AÑADE sin quitar (no destructivo)
   get_price(symbol, max_age_s=None)
   wait_for_price(symbol, timeout)    — bloqueante, con Condition
+  get_book_ticker(symbol)            — NUEVO: (bid, ask, ts) en crudo
   get_all_prices() / get_ticker() / get_change_24h() / get_all_tickers()
   get_all_changes_24h() / get_stale_symbols() / get_stats()
 """
 
 import asyncio
 import websockets
-import json
 import threading
 import time
 import math
 from datetime import datetime
 from typing import NamedTuple, Iterable, Optional
 import os
+
+# orjson es ~3-5x más rápido que el json de stdlib para parsear los
+# mensajes del WS (relevante con cientos de streams entrando a la vez).
+# Si no está instalado, se cae a json sin romper nada.
+try:
+    import orjson as _json
+    _JSON_LOADS = _json.loads
+except ImportError:
+    import json as _json
+    _JSON_LOADS = _json.loads
+import json as _json_std  # para json.dumps de los comandos SUBSCRIBE (siempre disponible)
 
 
 # ── Helpers de módulo ──────────────────────────────────────────────────────
@@ -62,15 +95,19 @@ class TickerData(NamedTuple):
 # Límite de Binance: 1024 streams por conexión combinada.
 _BINANCE_MAX_STREAMS = 1024
 
-# Stream de mercado completo. Con "@1s" refresca cada segundo pero manda
-# ~90 KB por mensaje (todos los símbolos); sin sufijo refresca cada 3 s,
-# que sigue estando muy por debajo de MAX_PRICE_AGE_S (5 s) del executor
-# y consume un tercio del ancho de banda. Los símbolos con posición
-# abierta tienen además su propio stream a 1 s, así que la frescura donde
-# importa no se pierde.
+# Stream de mercado completo (mark price). Con "@1s" refresca cada
+# segundo pero manda ~90 KB por mensaje (todos los símbolos); sin sufijo
+# refresca cada 3 s. Es sólo la RED DE SEGURIDAD para un símbolo que aún
+# no tiene su propio bookTicker suscrito — la frescura real de verdad la
+# da <symbol>@bookTicker (tiempo real, ver más abajo).
 _ALL_MARKET_ENABLED  = os.environ.get("WS_ALL_MARKET", "true").lower() == "true"
-_ALL_MARKET_INTERVAL = os.environ.get("WS_ALL_MARKET_INTERVAL", "3s").lower()
+_ALL_MARKET_INTERVAL = os.environ.get("WS_ALL_MARKET_INTERVAL", "1s").lower()
 _ALL_MARKET_STREAM   = "!markPrice@arr@1s" if _ALL_MARKET_INTERVAL == "1s" else "!markPrice@arr"
+
+# Stream de ticker 24h de TODOS los símbolos en un único slot, en vez de
+# pedir <symbol>@ticker uno por uno (eso costaba 1 stream extra POR
+# símbolo). Mismo flag que el de arriba: son las dos redes "globales".
+_ALL_TICKER_STREAM   = "!ticker@arr"
 
 _WS_BASE_URL = os.environ.get("WS_FSTREAM_URL", "wss://fstream.binance.com/market/stream")
 
@@ -110,8 +147,14 @@ class SymbolWebSocketPriceCache:
         self.symbols = sorted({s.upper() for s in symbols})
         self._check_limit(self.symbols)
 
-        # price_cache:  symbol -> (mark_price, timestamp)
+        # price_cache:  symbol -> (price, timestamp). Alimentado por
+        # bookTicker (mid bid/ask, tiempo real) con markPrice@arr como
+        # respaldo para símbolos sin bookTicker suscrito todavía.
         self.price_cache:  dict[str, tuple[float, float]] = {}
+        # book_cache:   symbol -> (bid, ask, timestamp), crudo, por si se
+        # necesita el spread real (p.ej. para estimar slippage) en vez
+        # del mid ya mezclado en price_cache.
+        self.book_cache:   dict[str, tuple[float, float, float]] = {}
         # ticker_cache: symbol -> TickerData (incluye ts)
         self.ticker_cache: dict[str, TickerData] = {}
 
@@ -144,18 +187,26 @@ class SymbolWebSocketPriceCache:
 
     @staticmethod
     def _check_limit(symbols: list[str]):
-        # 2 streams por símbolo (markPrice + ticker) + 1 del mercado completo.
-        needed = len(symbols) * 2 + (1 if _ALL_MARKET_ENABLED else 0)
+        # 1 stream por símbolo (bookTicker, tiempo real) + 2 globales
+        # (markPrice@arr + ticker@arr). Antes eran 2 streams POR símbolo
+        # (markPrice@1s + ticker), así que este cambio también DUPLICA
+        # cuántos símbolos caben por debajo del límite de Binance.
+        needed = len(symbols) * 1 + (2 if _ALL_MARKET_ENABLED else 0)
         if needed > _BINANCE_MAX_STREAMS:
             raise ValueError(
                 f"Binance permite máximo {_BINANCE_MAX_STREAMS} streams por conexión. "
-                f"{len(symbols)} símbolos necesitan {needed}. Divide en dos instancias."
+                f"{len(symbols)} símbolos necesitan {needed}. Divide en dos instancias "
+                f"(dos SymbolWebSocketPriceCache, cada una con su propia conexión)."
             )
 
     @staticmethod
     def _streams_for(symbol: str) -> list[str]:
-        s = symbol.lower()
-        return [f"{s}@markPrice@1s", f"{s}@ticker"]
+        # bookTicker individual = tiempo real de verdad (Binance lo manda
+        # en el instante en que cambia el mejor bid/ask, sin intervalo
+        # mínimo). Es lo que da los "ms" de frescura que markPrice@1s o
+        # ticker NUNCA pueden dar, porque esos sí tienen un intervalo
+        # mínimo fijo de 1 s en el propio servidor de Binance.
+        return [f"{symbol.lower()}@bookTicker"]
 
     def _desired_streams(self) -> set[str]:
         with self.lock:
@@ -163,6 +214,7 @@ class SymbolWebSocketPriceCache:
         wanted: set[str] = set()
         if _ALL_MARKET_ENABLED:
             wanted.add(_ALL_MARKET_STREAM)
+            wanted.add(_ALL_TICKER_STREAM)
         for sym in symbols_snapshot:
             wanted.update(self._streams_for(sym))
         return wanted
@@ -181,7 +233,7 @@ class SymbolWebSocketPriceCache:
             part["params"] = payload["params"][i:i + chunk]
             self._req_id += 1
             part["id"] = self._req_id
-            await self._ws.send(json.dumps(part))
+            await self._ws.send(_json_std.dumps(part))
 
     async def _sync_subscriptions(self):
         """Alinea las suscripciones del socket con la lista de símbolos
@@ -216,6 +268,21 @@ class SymbolWebSocketPriceCache:
             # tick, no en el siguiente sondeo.
             self._price_cv.notify_all()
 
+    def _store_book_ticker(self, symbol: str, bid: float, ask: float, now: float):
+        """bookTicker: mejor bid/ask en tiempo real. Se guarda el par
+        crudo (para quien lo necesite, p.ej. estimar slippage) Y el mid
+        (bid+ask)/2 como precio "fresco" en price_cache — así
+        get_price()/wait_for_price() quedan igual de rápidos que antes
+        pero ahora alimentados por el stream más rápido que ofrece
+        Binance, sin tocar ni una línea del executor."""
+        if not symbol or bid <= 0 or ask <= 0 or not math.isfinite(bid) or not math.isfinite(ask):
+            return
+        mid = (bid + ask) / 2.0
+        with self._price_cv:
+            self.book_cache[symbol] = (bid, ask, now)
+            self.price_cache[symbol] = (mid, now)
+            self._price_cv.notify_all()
+
     def _handle_payload(self, data: dict):
         now = time.time()
 
@@ -227,25 +294,45 @@ class SymbolWebSocketPriceCache:
 
         payload = data.get("data", data)
 
-        # !markPrice@arr llega como LISTA de objetos, uno por símbolo.
+        # !markPrice@arr / !ticker@arr llegan como LISTA de objetos, uno
+        # por símbolo. Cada elemento trae su propio "e" (event type):
+        # NUNCA asumir qué stream es sólo por la forma del objeto, porque
+        # markPriceUpdate y 24hrTicker comparten nombres de campo (p.ej.
+        # ambos tienen "p" — en uno es el precio, en el otro el cambio
+        # absoluto de 24h) y mezclarlos guardaría basura como "precio".
         if isinstance(payload, list):
             for item in payload:
-                if not isinstance(item, dict):
-                    continue
-                self._store_price(str(item.get("s", "")).upper(), _safe_float(item, "p"), now)
+                if isinstance(item, dict):
+                    self._dispatch_event(item, now)
             return
 
-        if not isinstance(payload, dict):
-            return
+        if isinstance(payload, dict):
+            self._dispatch_event(payload, now)
 
+    def _dispatch_event(self, payload: dict, now: float):
         event = payload.get("e")
         symbol = str(payload.get("s", "")).upper()
+        if not symbol:
+            return
 
-        if event == "markPriceUpdate":
+        # El stream RAW <symbol>@bookTicker (a diferencia de otros) no
+        # siempre trae "e" en todas las variantes de endpoint de Binance
+        # — el propio ejemplo oficial es {"u","s","b","B","a","A"} sin
+        # "e". Por eso, si no hay "e" pero SÍ están los campos de
+        # bid/ask ("b" y "a") y NO los de ticker/markPrice ("c" o "P"),
+        # se trata igualmente como bookTicker en vez de descartarlo.
+        is_book_ticker = event == "bookTicker" or (
+            event is None and "b" in payload and "a" in payload
+            and "c" not in payload and "P" not in payload
+        )
+
+        if is_book_ticker:
+            self._store_book_ticker(
+                symbol, _safe_float(payload, "b"), _safe_float(payload, "a"), now
+            )
+        elif event == "markPriceUpdate":
             self._store_price(symbol, _safe_float(payload, "p"), now)
         elif event == "24hrTicker":
-            if not symbol:
-                return
             with self.lock:
                 self.ticker_cache[symbol] = TickerData(
                     change_pct=_safe_float(payload, "P"),
@@ -306,8 +393,8 @@ class SymbolWebSocketPriceCache:
                     while self.running:
                         msg = await ws.recv()
                         try:
-                            self._handle_payload(json.loads(msg))
-                        except json.JSONDecodeError:
+                            self._handle_payload(_JSON_LOADS(msg))
+                        except Exception:
                             continue
 
             except asyncio.CancelledError:
@@ -471,6 +558,18 @@ class SymbolWebSocketPriceCache:
                     return None
                 self._price_cv.wait(timeout=min(remaining, 0.5))
 
+    def get_book_ticker(self, symbol: str, max_age_s: float | None = None) -> Optional[tuple[float, float]]:
+        """(bid, ask) crudos del bookTicker en tiempo real, o None si no
+        hay dato (o está más viejo que max_age_s)."""
+        with self.lock:
+            entry = self.book_cache.get(symbol.upper())
+            if not entry:
+                return None
+            bid, ask, ts = entry
+            if max_age_s is not None and (time.time() - ts) > max_age_s:
+                return None
+            return bid, ask
+
     def get_price_age(self, symbol: str) -> float | None:
         """Antigüedad en segundos del precio cacheado, o None si no hay."""
         with self.lock:
@@ -585,8 +684,9 @@ class SymbolWebSocketPriceCache:
         submit(self._monitor_health())
 
         print(
-            f"✅ WebSocket cache iniciado — {len(self.symbols)} símbolo(s) seguidos, "
-            f"1 conexión{', mercado completo ' + _ALL_MARKET_STREAM if _ALL_MARKET_ENABLED else ''}"
+            f"✅ WebSocket cache iniciado — {len(self.symbols)} símbolo(s) seguidos vía "
+            f"bookTicker (tiempo real), 1 conexión"
+            f"{', + ' + _ALL_MARKET_STREAM + ' + ' + _ALL_TICKER_STREAM if _ALL_MARKET_ENABLED else ''}"
         )
 
     def stop(self):
